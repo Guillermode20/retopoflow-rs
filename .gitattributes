@@ -1,0 +1,7 @@
+* text=auto eol=lf
+*.rs text diff=rust
+*.py text diff=python
+*.md text diff=markdown
+*.sh text eol=lf
+*.png binary
+*.blend binary

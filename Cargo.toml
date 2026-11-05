@@ -1,10 +1,11 @@
 [package]
 name = "retopoflow-rs"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 license = "GPL-3.0-or-later"
-description = "Rust retopology geometry engine with a Blender adapter"
+description = "Rust retopology geometry engine with a Blender add-on"
+repository = "https://github.com/Guillermode20/retopoflow-rs"
 
 [lib]
 name = "retopoflow_core"

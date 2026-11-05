@@ -1,12 +1,20 @@
 """Build a host-platform add-on: python scripts/build_addon.py [--output dist]."""
 import argparse
-import os
-from pathlib import Path
+import platform
 import shutil
 import subprocess
 import sys
 import tempfile
 import zipfile
+from pathlib import Path
+
+
+def platform_tag():
+    """linux-x86_64, macos-arm64, windows-x86_64, ... (native code is per OS/arch)."""
+    system = {'win32': 'windows', 'darwin': 'macos'}.get(sys.platform, sys.platform)
+    machine = platform.machine().lower()
+    machine = {'amd64': 'x86_64', 'aarch64': 'arm64'}.get(machine, machine)
+    return f'{system}-{machine}'
 
 
 def main():
@@ -30,7 +38,7 @@ def main():
     shutil.copy2(artifact, native / filename)
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    destination = output / f'retopoflow_rs-{sys.platform}.zip'
+    destination = output / f'retopoflow_rs-{platform_tag()}.zip'
     with tempfile.TemporaryDirectory() as temporary:
         archive = Path(temporary) / destination.name
         with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as bundle:
