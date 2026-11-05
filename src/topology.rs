@@ -101,7 +101,24 @@ fn split_explicit_edges(mesh: &mut Mesh, ids: &BTreeMap<Edge, usize>) {
 /// Faces with more than two crossing events (or crossing coplanar edge runs)
 /// are explicitly unsupported. No caps are generated. Failures are atomic.
 pub fn knife(mesh: &mut Mesh, origin: DVec3, normal: DVec3) -> Result<(), String> {
+    knife_faces(mesh, origin, normal, None)
+}
+
+/// Like [`knife`], but only faces listed in `allowed` are split (a finite,
+/// screen-space knife). Uncut neighbours receive the new edge vertices in their
+/// boundary so no cracks or T-junctions are created.
+pub fn knife_faces(
+    mesh: &mut Mesh,
+    origin: DVec3,
+    normal: DVec3,
+    allowed: Option<&BTreeSet<usize>>,
+) -> Result<(), String> {
     mesh.validate()?;
+    if let Some(allowed) = allowed
+        && allowed.iter().any(|&f| f >= mesh.faces.len())
+    {
+        return Err("Knife face index out of bounds".into());
+    }
     if !origin.is_finite()
         || !normal.is_finite()
         || normal.length() == 0.0
@@ -131,13 +148,20 @@ pub fn knife(mesh: &mut Mesh, origin: DVec3, normal: DVec3) -> Result<(), String
     let signs: Vec<_> = distances.iter().map(|&d| sign(d)).collect();
     let mut result = mesh.clone();
     let mut ids = BTreeMap::new();
-    let mut faces = Vec::new();
+    let mut faces: Vec<Vec<Vec<usize>>> = Vec::with_capacity(mesh.faces.len());
+    let mut deferred = Vec::new();
     let mut selection = BTreeSet::new();
-    for f in &mesh.faces {
+    for (index, f) in mesh.faces.iter().enumerate() {
         if !f.iter().any(|&v| signs[v] > 0) || !f.iter().any(|&v| signs[v] < 0) {
-            faces.push(f.clone());
+            faces.push(vec![f.clone()]);
             continue;
         }
+        if allowed.is_some_and(|a| !a.contains(&index)) {
+            deferred.push(index);
+            faces.push(Vec::new());
+            continue;
+        }
+        let mut pieces = Vec::new();
         let mut crossings = 0;
         for i in 0..f.len() {
             let prev = f[(i + f.len() - 1) % f.len()];
@@ -186,10 +210,26 @@ pub fn knife(mesh: &mut Mesh, origin: DVec3, normal: DVec3) -> Result<(), String
             if polygon.len() < 3 {
                 return Err("Plane cut would create a degenerate polygon".into());
             }
-            faces.push(polygon);
+            pieces.push(polygon);
         }
+        faces.push(pieces);
     }
-    result.faces = faces;
+    // Uncut faces adjacent to a cut edge gain the shared intersection vertex.
+    for index in deferred {
+        let f = &mesh.faces[index];
+        let mut polygon = Vec::with_capacity(f.len() + 2);
+        for i in 0..f.len() {
+            polygon.push(f[i]);
+            if let Some(&id) = ids.get(&edge(f[i], f[(i + 1) % f.len()])) {
+                polygon.push(id);
+            }
+        }
+        faces[index] = vec![polygon];
+    }
+    result.faces = faces.into_iter().flatten().collect();
+    if result.vertices.len() == mesh.vertices.len() && allowed.is_some() {
+        return Err("Knife line does not cross any faces".into());
+    }
     split_explicit_edges(&mut result, &ids);
     result.selected = selection.into_iter().collect();
     result.validate()?;
@@ -315,6 +355,31 @@ mod tests {
         assert!(m.edges.contains(&edge(2, shared)));
         assert!(m.edges.contains(&edge(shared, 3)));
         winding(&m);
+    }
+    #[test]
+    fn limited_knife_cuts_only_allowed_faces_without_cracks() {
+        // 1x2 grid: faces 0 (y 0..1) and 1 (y 1..2); cut along x=0.5 in face 0 only.
+        let mut m = grid(1, 2);
+        let allowed = BTreeSet::from([0]);
+        knife_faces(&mut m, DVec3::new(0.5, 0.0, 0.0), DVec3::X, Some(&allowed)).unwrap();
+        assert_eq!(m.faces.len(), 3);
+        // The shared edge (y=1) vertex is also inserted into the uncut face.
+        assert!(m.faces.iter().any(|f| f.len() == 5));
+        assert_eq!(m.selected.len(), 2);
+        winding(&m);
+        let mut untouched = grid(1, 2);
+        let before = format!("{untouched:?}");
+        let none = BTreeSet::new();
+        assert!(
+            knife_faces(
+                &mut untouched,
+                DVec3::new(0.5, 0.0, 0.0),
+                DVec3::X,
+                Some(&none)
+            )
+            .is_err()
+        );
+        assert_eq!(format!("{untouched:?}"), before);
     }
     #[test]
     fn knife_through_existing_vertices() {

@@ -55,6 +55,9 @@ pub struct Request {
     /// PolyPen: convert the triangle on the selected edge into a quad.
     #[serde(default)]
     pub quad: bool,
+    /// Knife: restrict the cut to these face indices (finite knife).
+    #[serde(default)]
+    pub faces: Option<Vec<usize>>,
 }
 fn default_normal() -> V {
     V::Z
@@ -103,6 +106,7 @@ fn execute_on_surface(request: Request, surface: &Surface) -> Result<Mesh, Strin
         edge,
         vertex,
         quad,
+        faces,
     } = request;
     mesh.validate()?;
     if points.iter().any(|p| !p.is_finite()) {
@@ -208,7 +212,10 @@ fn execute_on_surface(request: Request, surface: &Surface) -> Result<Mesh, Strin
                 mesh.vertices[i] = surface.closest(mesh.vertices[i]).point;
             }
         }
-        "knife" => topology::knife(&mut mesh, origin, normal)?,
+        "knife" => {
+            let allowed = faces.map(|f| f.into_iter().collect());
+            topology::knife_faces(&mut mesh, origin, normal, allowed.as_ref())?
+        }
         "delete" => mesh.delete_selected(),
         "face" => {
             if mesh.selected.len() < 3 {
