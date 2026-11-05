@@ -1,0 +1,21 @@
+# Lint config for the Blender add-on and test scripts (Python 3.11+, Blender's bpy).
+line-length = 120
+target-version = "py311"
+
+[lint]
+select = ["E", "F", "W", "B", "I"]
+ignore = [
+    "E402",   # bl_info must precede imports in Blender add-ons
+    "E731",   # small lambdas in property tables
+    "B905",   # zip(strict=) noise for parallel arrays
+]
+
+[lint.per-file-ignores]
+# Legacy test scripts use a compact style.
+"tests/blender_modal.py" = ["E2", "E7", "W", "E1", "E5"]
+"tests/blender_sources.py" = ["E2", "E7", "W", "E1", "E5"]
+"tests/blender_tools.py" = ["E2", "E7", "W", "E1", "E5"]
+
+[lint.isort]
+known-first-party = ["retopoflow_rs"]
+known-third-party = ["bpy", "bmesh", "blf", "gpu", "gpu_extras", "mathutils", "bpy_extras", "numpy"]
