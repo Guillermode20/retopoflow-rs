@@ -53,7 +53,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
       - run: pip install "ruff==${RUFF_VERSION}"
@@ -88,7 +88,7 @@ jobs:
           echo "url=https://download.blender.org/release/Blender${series}/$file" >> "$GITHUB_OUTPUT"
       - name: Cache Blender
         id: cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/blender
           key: ${{ steps.resolve.outputs.file }}
@@ -103,7 +103,7 @@ jobs:
         run: python3 tests/test_native_reload.py
       - name: Blender suites
         run: python3 scripts/run_blender_tests.py --blender ~/blender/blender
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: matrix.blender == '5.2'
         with:
           name: retopoflow_rs-linux-x86_64
