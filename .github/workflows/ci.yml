@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUFF_VERSION: "0.17.3"
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked
+
+  msrv:
+    name: Rust MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --all-targets
+
+  python:
+    name: Python lint and versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install "ruff==${RUFF_VERSION}"
+      - run: ruff check blender tests scripts
+      - run: python scripts/check_version.py
+
+  blender:
+    name: Blender ${{ matrix.blender }} (headless)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest supported LTS and the current release series.
+        blender: ["4.2", "5.2"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System libraries for Blender
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 \
+            libsm6 libice6 libx11-6 libxext6 libgl1 libegl1
+      - name: Resolve latest Blender ${{ matrix.blender }} patch release
+        id: resolve
+        run: |
+          series="${{ matrix.blender }}"
+          file=$(curl -fsSL "https://download.blender.org/release/Blender${series}/" \
+            | grep -o "blender-${series}\.[0-9]*-linux-x64\.tar\.xz" | sort -uV | tail -1)
+          test -n "$file"
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+          echo "url=https://download.blender.org/release/Blender${series}/$file" >> "$GITHUB_OUTPUT"
+      - name: Cache Blender
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: ~/blender
+          key: ${{ steps.resolve.outputs.file }}
+      - name: Download Blender
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/blender
+          curl -fsSL "${{ steps.resolve.outputs.url }}" | tar -xJ -C ~/blender --strip-components=1
+      - name: Build add-on
+        run: python3 scripts/build_addon.py
+      - name: Native reload regression
+        run: python3 tests/test_native_reload.py
+      - name: Blender suites
+        run: python3 scripts/run_blender_tests.py --blender ~/blender/blender
+      - uses: actions/upload-artifact@v4
+        if: matrix.blender == '5.2'
+        with:
+          name: retopoflow_rs-linux-x86_64
+          path: dist/*.zip
+          retention-days: 14

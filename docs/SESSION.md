@@ -32,19 +32,30 @@ Upstream: `config/keymaps.py`. Matching these keys does not imply the underlying
 
 ## Validation checklist
 
-Checked items below are covered by `tests/blender_session.py` using real Blender data and the actual session methods with deterministic event delivery. Only RNA operator construction / live window-manager event registration is bypassed. They are not a graphical mouse test.
+`tests/blender_session.py` constructs the real `Session` and delivers synthetic
+events through `Session.modal`, with every coordinate projected through a real
+viewport. Only the window manager's live event registration is bypassed.
+`tests/blender_gui.py` runs a live session in a window and captures screenshots
+for visual review (not run in CI, since it needs a display).
 
 - [x] Enter from Edit Mode and return to Edit Mode with the target intact.
-- [x] Enter with a new target and evaluated source meshes.
-- [x] Switch tools without exiting the operator or resetting selection.
-- [x] Perform two edits; undo and redo each independently.
-- [x] Cancel a partial drawing without leaving the session.
-- [x] Finish session, retaining geometry and restoring viewport settings.
-- [x] Cancel the entire session, restoring entry geometry and viewport settings.
-- [x] Restore UI/cache/mesh resources after an operation error or partial startup.
-- [ ] Confirm actual palette hit testing and GPU overlay drawing in a graphical viewport.
+- [x] Enter from a lone source: create a target, then continue it next time.
+- [x] Switch tools by key and by palette click without resetting selection.
+- [x] Undo and redo individual actions (keyboard and buttons).
+- [x] Cancel a gesture or close help with Esc without leaving the session.
+- [x] Finish, retaining geometry and restoring viewport settings and visibility.
+- [x] Discard the whole session, restoring entry geometry.
+- [x] Blender-initiated cancel keeps work.
+- [x] Restore UI, cache and mesh resources after an operation error or a failed start.
+- [x] Navigation events pass through; Ctrl-S is blocked.
+- [x] Picking, box selection, PolyPen strips and snapping, strokes and bridges, contours, knife, patches, fill, loops, Tweak and Relax brushes, HUD steppers and wheel.
+- [x] HUD placement and GPU overlay drawing in a graphical viewport (screenshot check on Blender 4.2 LTS and 5.2).
 
-Headless state/history tests can validate lifecycle logic, but cannot establish the final checkbox or claim visual parity.
+## Module responsibilities
+
+- `session.py`: event routing (HUD → gestures → shortcuts → navigation), the tools, presentation changes paired with restore callbacks, bmesh-snapshot history, and the overlay renderer.
+- `target.py`: one numpy snapshot of the target per change; screen projection and occlusion are cached per view.
+- `hud.py`: `layout(View) → Frame` is pure, and the same frame is used for drawing and hit testing.
 
 ## Upstream architecture references
 

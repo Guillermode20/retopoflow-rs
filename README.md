@@ -1,88 +1,90 @@
-# Rust retopology for Blender
+# Retopoflow RS
 
-A native Rust geometry engine and a thin Python/ctypes Blender add-on, using RetopoFlow 3 as a behavior reference. **Not yet a 1:1 RetopoFlow port.** The tools below perform real geometry operations; their remaining differences are explicitly listed. No upstream artwork, branding assets, or UI assets are bundled.
+[![CI](https://github.com/Guillermode20/retopoflow-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/Guillermode20/retopoflow-rs/actions/workflows/ci.yml)
 
-## Build and install
+Surface retopology for Blender: a native Rust geometry engine driven by a single in-viewport session, using [RetopoFlow 3](https://github.com/CGCookie/retopoflow) as a behaviour reference. It is **not** a 1:1 RetopoFlow port; the differences are listed below. No upstream artwork, branding or UI assets are bundled.
 
-Requires Rust (edition 2024), Python 3, and Blender. The add-on declares Blender 3.6+ support; automated integration has currently only been run on the locally installed Blender 5.2.2.
+Supports Blender **4.2 LTS and newer** (CI runs 4.2 LTS and 5.2).
 
-```sh
-cargo test
-cargo clippy --all-targets -- -D warnings
-python3 scripts/build_addon.py
-python3 tests/test_native_reload.py
-```
+## Install
 
-Install `dist/retopoflow_rs-linux.zip` (or the ZIP built on your platform) through Blender Preferences → Add-ons → Install from Disk. **Fully quit and reopen Blender after updating**, particularly from versions before 0.2.2. Native code now loads from a private runtime copy so ZIP reinstall cannot overwrite executing library pages (see `docs/NATIVE_LOADING.md`). Binaries are OS/architecture-specific; build on each target platform.
+Download the zip for your platform from [Releases](https://github.com/Guillermode20/retopoflow-rs/releases) (or build it, below) and install it through *Preferences → Add-ons → Install from Disk*. Native code is per OS and architecture. **Fully restart Blender after updating.** The native library loads from a private runtime copy, so reinstalling never overwrites code that is executing (see `docs/NATIVE_LOADING.md`).
 
 ## Use
 
-Use **Retopo RS** in the **3D View header** to enter one persistent viewport session with the active target, or the adjacent **+** to create a new target. The sidebar provides the same session entry; old standalone commands are hidden under **Legacy standalone commands**.
+1. Select your high-poly mesh in Object Mode and press **Retopo RS** in the 3D View header. A target mesh is created, or the scene's previous target is continued. To keep working on an existing retopology mesh, make it active instead. **+** always starts a new target.
+2. Retopologize with the tools in the palette (top left). Options for the current tool are top right, and a hint at the bottom says what a click will do. **F1** shows every shortcut.
+3. **Tab** (or Esc, or *Finish*) ends the session and keeps the work. **Shift-Esc** (or *Discard* twice) throws the session away.
 
-When the active object is explicitly chosen in **Source**, or is the only polygon mesh visible in Object Mode, startup creates a separate target automatically. An explicitly chosen source is included even if hidden. Zero-area evaluated source triangles are skipped in the temporary geometry cache without changing your source mesh; an entirely unusable source reports its name and the reason.
+The **Source** field in the sidebar picks the surface explicitly; when it's empty, every visible mesh except retopology targets is used. Source modifiers are evaluated.
 
-The session has an in-viewport tool palette and contextual options, shares selection across tools, and keeps native source geometry cached for the session. Numeric tool switching follows RF3: **1 Contours, 2 PolyStrips, 3 Strokes, 4 Patches, 5 PolyPen, 6 Knife, 7 Loops, 8 Tweak, 9 Relax, 0 Select**. Do not launch a new operator for each stroke.
+| Key | Tool | What it does |
+| --- | --- | --- |
+| 1 | Contours | Drag a line across a form to add a ring. With a boundary selected it bridges to it. |
+| 2 | PolyStrips | Drag along the surface to paint a strip of quads; width is in screen pixels. |
+| 3 | Strokes | Draw an edge chain (ending near the start closes it). Drawing beside a selected boundary bridges it with quads, in either direction. |
+| 4 | Patches | Click four corners for a grid. **F** fills any selected boundary loop with automatic corner detection. |
+| 5 | PolyPen | Click to place vertices; hovering snaps to vertices and edges. With an edge selected, a click makes a triangle, and the next click completes it to a quad (Tri → Quad), so strips build quickly. Ctrl-click starts a new chain. |
+| 6 | Knife | Drag a line across faces to cut only the faces it crosses. |
+| 7 | Loops | Hover an edge to preview the loop, then click to insert it where you point (or at the centre). |
+| 8 | Tweak | Brush-drag vertices along the surface with falloff. |
+| 9 | Relax | Brush to even out spacing; boundaries stay fixed. |
+| 0 / W | Select | Click a vertex or edge, drag a box. Shift adds/toggles, Ctrl removes. |
 
-**Ctrl-Z / Ctrl-Shift-Z** undo/redo committed actions inside the session. **Esc/right-click during drawing** discards that gesture and keeps the session open. **Tab or idle Esc** finishes the session; **Shift-Esc** cancels the whole session. Presentation settings are restored on exit. Save outside the session. See `docs/SESSION.md` for the integration contract and validation status.
+In every tool: **Shift-click** selects, **A / Alt-A** select all/none, **Ctrl-I** inverts, **Ctrl-L** selects linked, **M** merges, **X** deletes, **Ctrl-wheel** adjusts the tool's main setting, and **Ctrl-Z / Ctrl-Shift-Z** undo/redo each action. Navigation (middle mouse, wheel, numpad, Alt-drag) works as usual. Errors appear as toasts and never end the session.
 
-- **Project / Relax / Tweak:** nearest-surface projection, boundary-preserving Laplacian smoothing, and drag-translation projected onto the source.
-- **Stroke:** drag on the source to draw a resampled edge chain. Closed Stroke creates a loop.
-- **Boundary Bridge:** select one unbranched boundary; draw a matching stroke with the same vertex count and closure. Produces quads.
-- **Ribbon Strip:** drag a centerline; Width controls the full distance between projected rails.
-- **Four-click Patch:** click four perimeter corners in winding order; Count and Rows control the quad-cell dimensions.
-- **Fill Patch:** select a rectangular closed boundary with exactly `2*(Count + Rows)` edges. Reuses its vertices and fills it with a projected Coons grid. The first ordered boundary vertex is the first corner; opposite sides must match the configured dimensions.
-- **Contour:** drag a line to define a view-perpendicular plane; creates the nearest source section. Contour Boundary Bridge joins it to a selected matching boundary, aligning start and direction automatically.
-- **Insert Loop:** click within 24 pixels of a target edge. Traverses its quad ring/strip and inserts a loop at Loop Factor. Rejects non-quad and twisted paths.
-- **Plane Cut:** drag a line defining an infinite cutting plane. Splits intersected target faces with shared intersections. This is a plane cut, not arbitrary finite multi-segment RetopoFlow Knife.
-- **PolyPen:** project/snap a click; chain from a selected vertex, extrude a triangle from a selected boundary edge, or split a nearby target edge. Inside the integrated session, each insertion is independently undoable; tool switching does not end drawing mode. It does not implement full automatic triangle/quad inference.
-- **Merge:** weld selected vertices at their projected center, remapping topology and rejecting invalid vertex fans.
-- **Selection:** all/none/invert/connected and shortest topological path between two selected endpoints.
+The target is drawn by the session's own overlay. Faces are tinted and selection is orange, with a faint x-ray pass so geometry that dips under a curved surface stays readable. Blender's header, toolbar, sidebar, gizmos and overlay text are hidden during the session and restored afterwards.
 
-Draw previews show the input stroke/plane/corners, not a complete live reconstruction of the resulting mesh. Per-action session history handles undo/redo internally; the legacy standalone commands still use Blender operator undo.
+### Data safety
 
-### Data safety and limits
+Coordinates cross the native boundary in world space. Selection and coordinate-only edits (tweak, relax) preserve all mesh data. Topology edits refuse meshes with UVs, color attributes, custom attributes or normals, or vertex groups, rather than silently dropping them. Default flat shading is fine. Shape-key meshes are rejected for edits. Every action is transactional: a rejected operation leaves the mesh untouched. Save outside the session (Ctrl-S is blocked inside it). Keep backups of production assets.
 
-Coordinates cross the ABI in world space and return to target-local space. Selection and coordinate-only operations preserve mesh attributes; shape-key coordinate edits are rejected. Topology-changing operations reject UV/color/custom-attribute/vertex-group/custom-normal data rather than silently deleting it. Default flat shading and unmarked sharp-edge data are accepted; nondefault shading attributes remain protected. Multi-material and other complex data transfer is not a completed feature. Keep a backup of production assets.
+## Build and test
 
-Stroke sample counts are 2–4096 (closed minimum 3), patch dimensions are bounded, and malformed/nonfinite inputs are rejected. Geometry requests are transactional. Modal drawing caches an immutable native source BVH for the session and releases it on finish/cancel. Standalone button operations construct their source per request; source changes are not incorporated into an already-running drawing session. Source evaluation uses modifiers; target topology operates on the base mesh.
-
-## Tests
+Requires Rust 1.88+, Python 3 and Blender.
 
 ```sh
-blender --background --factory-startup --python-exit-code 1 --python tests/blender_smoke.py
-blender --background --factory-startup --python-exit-code 1 --python tests/blender_tools.py
-blender --background --factory-startup --python-exit-code 1 --python tests/blender_modal.py
-blender --background --factory-startup --python-exit-code 1 --python tests/blender_session.py
-blender --background --factory-startup --python-exit-code 1 --python tests/blender_sources.py
+./scripts/check.sh            # fmt, clippy, cargo test, ruff, version sync, build, all Blender suites
+./scripts/check.sh --no-blender
+python3 scripts/build_addon.py   # → dist/retopoflow_rs-<os>-<arch>.zip
+python3 scripts/run_blender_tests.py --blender /path/to/blender
+blender --factory-startup --python tests/blender_gui.py -- shots/   # screenshots of a live session
 ```
 
-Rust tests cover construction, sections, shared knife intersections, open/closed quad rings, pen snapping, weld rollback, boundary filling, selection, malformed options and ABI ownership. Blender tests cover world/local transforms, tool dispatch, mesh reconstruction and attribute-preservation/rejection. Deterministic modal tests exercise repeated pen commits and cancelled partial patches. Session tests exercise Edit Mode entry/exit, multiple sources, per-action undo/redo, gesture cancellation, whole-session cancellation, native cache release, new-target finish and failed-start restoration. Headless tests do not verify actual mouse gestures, rendered previews, or Blender's live user undo workflows.
+Rust tests cover construction, sections, knife intersections, quad rings, PolyPen inference, fills, selection, malformed input and ABI ownership. The Blender suites drive the real session through `Session.modal` with synthetic events, projected through a real viewport: picking, box select, PolyPen strips, strokes/bridges, contours, knife, patches, fill, loops, brushes, HUD clicks, undo/redo, lifecycle and restoration. GPU drawing needs a display, so `tests/blender_gui.py` captures screenshots instead.
 
-## Native API
+## Architecture
 
-`rf_execute(const char *json)` returns allocated NUL-terminated JSON; free it exactly once with `rf_free(pointer)`. Use ctypes `c_void_p`, not a `c_char_p` return type, to preserve allocation ownership.
+```
+src/                     Rust engine (cdylib): JSON C ABI, one operation per call
+blender/retopoflow_rs/
+  engine.py              ctypes bridge, numpy mesh I/O, in-place mesh rebuilds
+  target.py              cached target topology, projection, occlusion-aware picking
+  session.py             the modal session (plain Session class + thin operator)
+  hud.py, gfx.py         HUD layout (pure, shared by drawing and hit testing) and GPU helpers
+  legacy.py              standalone one-shot operators for scripting
+```
 
-Requests contain `mesh` (`vertices`, `edges`, `faces`, `selected`), triangulated `source`, and `operation`; results contain `ok` and either `mesh` or `error`. For repeated operations, `rf_source_create(Source JSON)` returns a process-local `uint64_t` handle (0 on error); `rf_execute_cached(request JSON, handle)` permits omitting `source`; release the handle with `rf_source_free(handle)`. Unknown or released handles return errors, not dangling-pointer access. Options: `points`, `count`, `closed`, `rows`, `width`, `strength`, `iterations`, `origin`, `normal`, `edge`, `factor`. See `src/lib.rs` and `tests/native_operations.rs` for examples.
+`rf_execute(const char *json)` returns allocated NUL-terminated JSON; free it once with `rf_free`. Requests carry `mesh` (`vertices`, `edges`, `faces`, `selected`), triangulated `source` and `operation`. `rf_source_create` / `rf_execute_cached` / `rf_source_free` cache a source BVH for a session. See `src/lib.rs` and `tests/native_operations.rs`.
 
-## Upstream reference and parity
+## Parity with RetopoFlow 3
 
-Reference: https://github.com/CGCookie/retopoflow at commit `ac2570c5292c1dd90190fd3641b4dbc42cf4bd63`. Relevant upstream entry points are recorded in `docs/REFERENCE.md`.
+Reference: CGCookie/retopoflow at `ac2570c5292c1dd90190fd3641b4dbc42cf4bd63` (see `docs/REFERENCE.md`).
 
-| Tool | Implemented here | Remaining differences |
+| Tool | Here | Missing |
 | --- | --- | --- |
-| Select | Viewport vertex picking, selection sets, connected/path | RF edge/face smart selection and paint selection |
-| Relax | Projected smoothing with fixed boundaries | Interactive brush falloff and RF solver behavior |
-| Tweak | Projected selected-vertex drag | RF brush behavior and snapping/merge heuristics |
-| Strokes | Edge chains and matching boundary extrusion | Span modes, endpoint joins, automatic face inference |
-| PolyPen | Snapping, chain/triangle insertion, edge split | Automatic quads and RF insertion state machine |
-| Contours | Open/closed plane sections and aligned bridges | Interactive count edits, loop manipulation, multi-source behavior |
-| PolyStrips | Surface-normal ribbons | Bézier handles, crossing detection, strip editing |
-| Patches | Four-corner grids and rectangular boundary Coons fill | L/C-shaped regions, automatic corner detection |
-| Loops | Open/closed quad-ring insertion with factor | Interactive slide and RF preview/state machine |
-| Knife | Shared-vertex infinite-plane cutting | Finite/freeform multi-segment screen-space knife |
+| Select | Click/box, linked, invert, path (standalone) | Paint selection, face/edge smart select |
+| PolyPen | Vertex/edge snapping, Tri → Quad strips, edge split | Edge-slide insertion, RF's full insertion state machine |
+| Strokes | Chains, auto-close, aligned boundary bridges | Span/extrude modes, endpoint joins |
+| Contours | Plane sections, bridges to selected boundary | Interactive ring count/rotation editing |
+| PolyStrips | Ribbons along a stroke | Bézier handles, strip editing, crossings |
+| Patches | Four-corner grids, auto-corner loop fill | L/C-shaped fills |
+| Loops | Ring/strip insertion with live preview | Interactive slide after insertion |
+| Knife | Finite cut across crossed faces | Multi-segment freeform knife |
+| Tweak / Relax | Falloff brushes projected to the surface | RF's solver details, merge-on-drop |
 
-The session shell recreates the persistent viewport interaction model, but does not reproduce RF's original HTML-backed UI, custom target renderer, every keymap/preference, symmetry system or full topology-aware data transfer. Visual and tool-workflow parity remain incomplete. No tool is claimed to have complete upstream parity.
+Symmetry, per-tool preferences and topology-aware data transfer are not implemented.
 
 ## License
 
-GPL-3.0-or-later (`LICENSE`). Upstream code licensing/provenance is in `REFERENCE_LICENSE.txt`; upstream non-code assets are separately restricted and are not copied. This independently named project is not endorsed by the upstream authors.
+GPL-3.0-or-later (`LICENSE`). Upstream code licensing and provenance are recorded in `REFERENCE_LICENSE.txt`. Upstream non-code assets are separately restricted and are not copied. This independently named project is not endorsed by the upstream authors.
