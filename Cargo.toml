@@ -1,0 +1,20 @@
+[package]
+name = "retopoflow-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-3.0-or-later"
+description = "Rust retopology geometry engine with a Blender adapter"
+
+[lib]
+name = "retopoflow_core"
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+glam = { version = "=0.30.10", features = ["serde"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.149"
+
+[profile.release]
+lto = "thin"
+

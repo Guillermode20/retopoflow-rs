@@ -1,0 +1,8 @@
+/target/
+/dist/
+__pycache__/
+*.pyc
+*.blend*
+/blender/retopoflow_rs/native/*
+!/blender/retopoflow_rs/native/.gitkeep
+
