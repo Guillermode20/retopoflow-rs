@@ -1,6 +1,11 @@
 //! Surface-projected construction tools. Operations commit only after validation.
-use crate::{math::resample, mesh::Mesh, surface::Surface};
+use crate::{
+    math::resample,
+    mesh::{Mesh, face_edges},
+    surface::Surface,
+};
 use glam::DVec3;
+use std::collections::BTreeSet;
 
 const MAX_GRID: usize = 65_536;
 fn finite(points: &[DVec3]) -> Result<(), String> {
@@ -10,7 +15,77 @@ fn finite(points: &[DVec3]) -> Result<(), String> {
         Ok(())
     }
 }
-fn commit(mesh: &mut Mesh, next: Mesh) -> Result<(), String> {
+/// Faces appended after `first_new` that share no edge with older faces are
+/// free to choose their winding. Orient them so their normals agree with the
+/// source surface, so Blender shading and modifiers see outward-facing quads.
+pub fn orient_new_faces(mesh: &mut Mesh, first_new: usize, surface: &Surface) {
+    if first_new >= mesh.faces.len() {
+        return;
+    }
+    let old: BTreeSet<_> = mesh.faces[..first_new]
+        .iter()
+        .flat_map(|f| face_edges(f))
+        .collect();
+    if mesh.faces[first_new..]
+        .iter()
+        .flat_map(|f| face_edges(f))
+        .any(|e| old.contains(&e))
+    {
+        return;
+    }
+    let agreement: f64 = mesh.faces[first_new..]
+        .iter()
+        .map(|f| {
+            let points: Vec<_> = f.iter().map(|&i| mesh.vertices[i]).collect();
+            let normal = (1..points.len() - 1)
+                .map(|i| (points[i] - points[0]).cross(points[i + 1] - points[0]))
+                .sum::<DVec3>();
+            let centroid = points.iter().sum::<DVec3>() / points.len() as f64;
+            normal.dot(surface.closest(centroid).normal)
+        })
+        .sum();
+    if agreement < 0.0 {
+        for face in &mut mesh.faces[first_new..] {
+            face.reverse();
+        }
+    }
+}
+
+/// Reorder `points` (reversing, and cyclically shifting closed loops) so they
+/// best match `boundary` index-for-index. Prevents twisted bridges when a stroke
+/// or contour is drawn in the opposite direction to the selected boundary.
+pub fn align(boundary: &[DVec3], points: &[DVec3], closed: bool) -> Vec<DVec3> {
+    let count = points.len();
+    let mut best = (f64::INFINITY, points.to_vec());
+    if count == 0 || boundary.len() != count {
+        return best.1;
+    }
+    for reverse in [false, true] {
+        for shift in 0..if closed { count } else { 1 } {
+            let candidate: Vec<_> = (0..count)
+                .map(|i| {
+                    points[if reverse {
+                        (shift + count - 1 - i) % count
+                    } else {
+                        (shift + i) % count
+                    }]
+                })
+                .collect();
+            let cost = boundary
+                .iter()
+                .zip(&candidate)
+                .map(|(a, b)| a.distance_squared(*b))
+                .sum::<f64>();
+            if cost < best.0 {
+                best = (cost, candidate);
+            }
+        }
+    }
+    best.1
+}
+
+fn commit(mesh: &mut Mesh, mut next: Mesh, surface: &Surface) -> Result<(), String> {
+    orient_new_faces(&mut next, mesh.faces.len(), surface);
     next.validate()?;
     for face in next.faces.iter().skip(mesh.faces.len()) {
         if face.len() == 4 {
@@ -67,7 +142,7 @@ pub fn patch(
         }
     }
     next.selected = (base..next.vertices.len()).collect();
-    commit(mesh, next)
+    commit(mesh, next, surface)
 }
 /// `count` is the number of centerline samples; `width` is the full rail separation.
 pub fn polystrip(
@@ -106,7 +181,7 @@ pub fn polystrip(
         next.add_face(vec![a, a + 1, a + 3, a + 2]);
     }
     next.selected = (base..next.vertices.len()).collect();
-    commit(mesh, next)
+    commit(mesh, next, surface)
 }
 
 /// Add a resampled plane section, optionally bridging an equally sized selected boundary.
@@ -156,29 +231,9 @@ pub fn contour(
         if boundary.len() != count || looped != closed {
             return Err("Selected boundary must match contour size and closure".into());
         }
-        let mut best = (f64::INFINITY, points.clone());
-        for reverse in [false, true] {
-            for shift in 0..if closed { count } else { 1 } {
-                let candidate: Vec<_> = (0..count)
-                    .map(|i| {
-                        points[if reverse {
-                            (shift + count - 1 - i) % count
-                        } else {
-                            (shift + i) % count
-                        }]
-                    })
-                    .collect();
-                let cost = boundary
-                    .iter()
-                    .zip(&candidate)
-                    .map(|(&a, &b)| mesh.vertices[a].distance_squared(b))
-                    .sum::<f64>();
-                if cost < best.0 {
-                    best = (cost, candidate);
-                }
-            }
-        }
-        let ids: Vec<_> = best.1.into_iter().map(|p| next.add_vertex(p)).collect();
+        let boundary_points: Vec<_> = boundary.iter().map(|&i| mesh.vertices[i]).collect();
+        let aligned = align(&boundary_points, &points, closed);
+        let ids: Vec<_> = aligned.into_iter().map(|p| next.add_vertex(p)).collect();
         for i in 0..if closed { count } else { count - 1 } {
             let j = (i + 1) % count;
             next.add_face(vec![boundary[i], boundary[j], ids[j], ids[i]]);
@@ -187,7 +242,7 @@ pub fn contour(
     } else {
         next.selected = next.add_chain(&points, closed);
     }
-    commit(mesh, next)
+    commit(mesh, next, surface)
 }
 
 #[cfg(test)]
@@ -224,6 +279,31 @@ mod tests {
                 > 0.
         }));
         m.validate().unwrap();
+    }
+    #[test]
+    fn clockwise_patch_faces_the_source() {
+        let mut m = Mesh::default();
+        // Clockwise corners would naively produce -Z normals.
+        patch(
+            &mut m,
+            &plane(),
+            &[DVec3::ZERO, DVec3::Y, DVec3::X + DVec3::Y, DVec3::X],
+            2,
+            2,
+        )
+        .unwrap();
+        for f in &m.faces {
+            let [a, b, c] = [0, 1, 2].map(|i| m.vertices[f[i]]);
+            assert!((b - a).cross(c - a).z > 0.0);
+        }
+    }
+    #[test]
+    fn align_reverses_and_rotates() {
+        let boundary = [DVec3::ZERO, DVec3::X, DVec3::Y];
+        let reversed = [DVec3::Y, DVec3::X, DVec3::ZERO];
+        assert_eq!(align(&boundary, &reversed, false), boundary.to_vec());
+        let rotated = [DVec3::X, DVec3::Y, DVec3::ZERO];
+        assert_eq!(align(&boundary, &rotated, true), boundary.to_vec());
     }
     #[test]
     fn strip_width_and_rejections() {

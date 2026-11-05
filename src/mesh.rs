@@ -62,6 +62,10 @@ pub type Edge = [usize; 2];
 pub fn edge(a: usize, b: usize) -> Edge {
     if a < b { [a, b] } else { [b, a] }
 }
+/// Undirected edges around a polygon, in winding order.
+pub fn face_edges(face: &[usize]) -> impl Iterator<Item = Edge> + '_ {
+    (0..face.len()).map(move |i| edge(face[i], face[(i + 1) % face.len()]))
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Mesh {

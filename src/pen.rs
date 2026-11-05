@@ -55,6 +55,19 @@ fn validate(mesh: &Mesh) -> Result<(), String> {
     Ok(())
 }
 
+/// PolyPen insertion parameters beyond the clicked point.
+#[derive(Clone, Debug, Default)]
+pub struct PenOptions {
+    /// Split this existing edge at the click instead of extending the selection.
+    pub edge: Option<[usize; 2]>,
+    /// Reuse an existing vertex within this distance (mesh units).
+    pub snap_distance: f64,
+    /// Reuse exactly this vertex (screen-space snapping done by the caller).
+    pub vertex: Option<usize>,
+    /// Turn the triangle on the selected edge into a quad (Tri/Quad mode).
+    pub quad: bool,
+}
+
 /// Project a click onto the source, then insert/reuse a vertex.
 /// Zero/one selected vertices create a loose chain, selecting the clicked vertex.
 /// Two selected vertices must define a boundary/loose edge and create a triangle;
@@ -69,13 +82,97 @@ pub fn insert(
     edge_hint: Option<[usize; 2]>,
     snap_distance: f64,
 ) -> Result<(), String> {
+    insert_with(
+        mesh,
+        surface,
+        point,
+        &PenOptions {
+            edge: edge_hint,
+            snap_distance,
+            ..PenOptions::default()
+        },
+    )
+}
+
+fn polygon_normal(mesh: &Mesh, face: &[usize]) -> DVec3 {
+    let origin = mesh.vertices[face[0]];
+    (1..face.len() - 1)
+        .map(|i| (mesh.vertices[face[i]] - origin).cross(mesh.vertices[face[i + 1]] - origin))
+        .sum()
+}
+
+/// Tri/Quad: with the selected edge `[a, b]` bounding exactly one triangle,
+/// insert the new vertex into that triangle, making a quad. Returns `None` when
+/// the selection is not such an edge (the caller then inserts a triangle).
+fn quad_from_triangle(next: &Mesh, id: usize) -> Option<Result<Mesh, String>> {
+    let &[a, b] = next.selected.as_slice() else {
+        return None;
+    };
+    let owners: Vec<_> = next
+        .faces
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| (0..f.len()).any(|i| edge(f[i], f[(i + 1) % f.len()]) == edge(a, b)))
+        .map(|(i, _)| i)
+        .collect();
+    let &[owner] = owners.as_slice() else {
+        return None;
+    };
+    let triangle = next.faces[owner].clone();
+    if triangle.len() != 3 {
+        return None;
+    }
+    if triangle.contains(&id) {
+        return Some(Err("Click away from the triangle to make a quad".into()));
+    }
+    let apex = *triangle.iter().find(|&&v| v != a && v != b)?;
+    // Prefer inserting between the selected pair; fall back to the edge between
+    // the newest vertex `b` and the apex if the first quad would self-intersect.
+    let mut last_error = String::new();
+    for (u, v) in [(a, b), (b, apex)] {
+        let shared = next.faces.iter().enumerate().any(|(fi, f)| {
+            fi != owner && (0..f.len()).any(|i| edge(f[i], f[(i + 1) % f.len()]) == edge(u, v))
+        });
+        if shared {
+            continue;
+        }
+        let mut candidate = next.clone();
+        let face = &mut candidate.faces[owner];
+        let i = (0..3).find(|&i| edge(face[i], face[(i + 1) % 3]) == edge(u, v))?;
+        face.insert(i + 1, id);
+        candidate.edges.retain(|e| edge(e[0], e[1]) != edge(u, v));
+        candidate.selected = vec![b, id];
+        dedup_edges(&mut candidate);
+        match validate(&candidate) {
+            Ok(()) => return Some(Ok(candidate)),
+            Err(error) => last_error = error,
+        }
+    }
+    Some(Err(if last_error.is_empty() {
+        "Cannot extend that triangle into a quad".into()
+    } else {
+        format!("Quad rejected: {last_error}")
+    }))
+}
+
+/// [`insert`] with screen-space vertex snapping and Tri/Quad support.
+pub fn insert_with(
+    mesh: &mut Mesh,
+    surface: &Surface,
+    point: DVec3,
+    options: &PenOptions,
+) -> Result<(), String> {
     mesh.validate()?;
+    let snap_distance = options.snap_distance;
     if !point.is_finite() || !snap_distance.is_finite() || snap_distance < 0.0 {
         return Err("Pen requires a finite point and nonnegative finite snap distance".into());
     }
+    if options.vertex.is_some_and(|v| v >= mesh.vertices.len()) {
+        return Err("Pen snap vertex does not exist".into());
+    }
     let mut next = mesh.clone();
     let projected = surface.closest(point).point;
-    if let Some([a, b]) = edge_hint {
+    if let Some([a, b]) = options.edge {
         if !next.incidence().contains_key(&edge(a, b)) {
             return Err("Pen split edge does not exist".into());
         }
@@ -114,16 +211,22 @@ pub fn insert(
         {
             return Err("Select an existing edge for triangle insertion".into());
         }
-        let nearest = next
-            .vertices
-            .iter()
-            .enumerate()
-            .map(|(i, p)| (i, p.distance(projected)))
-            .filter(|(_, d)| *d <= snap_distance)
-            .min_by(|a, b| a.1.total_cmp(&b.1));
-        let id = nearest
-            .map(|(i, _)| i)
-            .unwrap_or_else(|| next.add_vertex(projected));
+        let nearest = options.vertex.or_else(|| {
+            next.vertices
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (i, p.distance(projected)))
+                .filter(|(_, d)| *d <= snap_distance)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(i, _)| i)
+        });
+        let id = nearest.unwrap_or_else(|| next.add_vertex(projected));
+        if options.quad
+            && let Some(result) = quad_from_triangle(&next, id)
+        {
+            *mesh = result?;
+            return Ok(());
+        }
         match next.selected.as_slice() {
             [] => next.selected = vec![id],
             &[a] => {
@@ -148,28 +251,27 @@ pub fn insert(
                             })
                         })
                     };
-                    if !fits(&face) {
-                        face.reverse();
+                    let reversed: Vec<_> = face.iter().rev().copied().collect();
+                    if fits(&face) && fits(&reversed) {
+                        // Unconstrained by neighbours: face the source normal.
+                        let centroid = face.iter().map(|&i| next.vertices[i]).sum::<DVec3>() / 3.0;
+                        if polygon_normal(&next, &face).dot(surface.closest(centroid).normal) < 0.0
+                        {
+                            face = reversed;
+                        }
+                    } else if !fits(&face) {
+                        face = reversed;
                     }
                     if !fits(&face) {
                         return Err("No consistent triangle winding".into());
                     }
-                    let p = next.vertices[face[0]];
-                    let new_normal = (next.vertices[face[1]] - p).cross(next.vertices[face[2]] - p);
+                    let new_normal = polygon_normal(&next, &face);
                     for old in &next.faces {
                         if (0..old.len())
                             .any(|i| edge(old[i], old[(i + 1) % old.len()]) == edge(a, b))
+                            && new_normal.dot(polygon_normal(&next, old)) <= 0.0
                         {
-                            let origin = next.vertices[old[0]];
-                            let old_normal = (1..old.len() - 1)
-                                .map(|i| {
-                                    (next.vertices[old[i]] - origin)
-                                        .cross(next.vertices[old[i + 1]] - origin)
-                                })
-                                .sum::<DVec3>();
-                            if new_normal.dot(old_normal) <= 0.0 {
-                                return Err("Pen extrusion overlaps or folds back across the selected face; click outside its boundary".into());
-                            }
+                            return Err("Pen extrusion overlaps or folds back across the selected face; click outside its boundary".into());
                         }
                     }
                     next.faces.push(face);
@@ -278,6 +380,81 @@ mod tests {
         assert_eq!(m.vertices[3].z, 0.);
         insert(&mut m, &surface(), DVec3::new(2., -1., 1.), None, 0.01).unwrap();
         assert_eq!(m.faces.len(), 3);
+    }
+    #[test]
+    fn tri_quad_builds_a_quad_strip() {
+        // Loose edge 0-1 along X; build a strip upward in +Y.
+        let mut m = Mesh {
+            vertices: vec![DVec3::ZERO, DVec3::X],
+            edges: vec![[0, 1]],
+            selected: vec![0, 1],
+            ..Mesh::default()
+        };
+        let quad = |quad| PenOptions {
+            snap_distance: 0.01,
+            quad,
+            ..PenOptions::default()
+        };
+        insert_with(&mut m, &surface(), DVec3::new(1., 1., 0.), &quad(true)).unwrap();
+        assert_eq!(m.faces.len(), 1);
+        assert_eq!(m.faces[0].len(), 3);
+        // Unconstrained triangle faces the +Z source normal.
+        assert!(polygon_normal(&m, &m.faces[0]).z > 0.0);
+        insert_with(&mut m, &surface(), DVec3::new(0., 1., 0.), &quad(true)).unwrap();
+        assert_eq!(m.faces.len(), 1);
+        assert_eq!(m.faces[0].len(), 4, "{:?}", m.faces);
+        assert!(polygon_normal(&m, &m.faces[0]).z > 0.0);
+        let far: BTreeSet<_> = m.selected.iter().copied().collect();
+        assert_eq!(far, BTreeSet::from([2, 3]));
+        // Next pair of clicks extends the strip with a second quad.
+        insert_with(&mut m, &surface(), DVec3::new(1., 2., 0.), &quad(true)).unwrap();
+        insert_with(&mut m, &surface(), DVec3::new(0., 2., 0.), &quad(true)).unwrap();
+        assert_eq!(m.faces.len(), 2);
+        assert!(m.faces.iter().all(|f| f.len() == 4));
+        assert!(m.faces.iter().all(|f| polygon_normal(&m, f).z > 0.0));
+        m.validate().unwrap();
+    }
+    #[test]
+    fn tri_quad_accepts_either_click_order() {
+        let mut m = Mesh {
+            vertices: vec![DVec3::ZERO, DVec3::X],
+            edges: vec![[0, 1]],
+            selected: vec![0, 1],
+            ..Mesh::default()
+        };
+        let options = PenOptions {
+            snap_distance: 0.01,
+            quad: true,
+            ..PenOptions::default()
+        };
+        // First click above vertex 0, then above vertex 1 (the reverse of the strip test).
+        insert_with(&mut m, &surface(), DVec3::new(0., 1., 0.), &options).unwrap();
+        insert_with(&mut m, &surface(), DVec3::new(1., 1., 0.), &options).unwrap();
+        assert_eq!(m.faces.len(), 1);
+        assert_eq!(m.faces[0].len(), 4);
+        m.validate().unwrap();
+    }
+    #[test]
+    fn explicit_vertex_snap_closes_chain() {
+        let mut m = Mesh {
+            vertices: vec![DVec3::ZERO, DVec3::X, DVec3::Y],
+            edges: vec![[0, 1], [1, 2]],
+            selected: vec![2],
+            ..Mesh::default()
+        };
+        let options = PenOptions {
+            vertex: Some(0),
+            ..PenOptions::default()
+        };
+        insert_with(&mut m, &surface(), DVec3::new(5., 5., 5.), &options).unwrap();
+        assert_eq!(m.vertices.len(), 3);
+        assert!(m.edges.contains(&[0, 2]));
+        assert_eq!(m.selected, vec![0]);
+        let bad = PenOptions {
+            vertex: Some(99),
+            ..PenOptions::default()
+        };
+        assert!(insert_with(&mut m, &surface(), DVec3::ZERO, &bad).is_err());
     }
     #[test]
     fn split_and_endpoint_snap() {

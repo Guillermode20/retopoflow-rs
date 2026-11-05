@@ -49,6 +49,12 @@ pub struct Request {
     pub factor: f64,
     #[serde(default)]
     pub edge: Option<[usize; 2]>,
+    /// PolyPen: reuse this existing vertex instead of projecting a new one.
+    #[serde(default)]
+    pub vertex: Option<usize>,
+    /// PolyPen: convert the triangle on the selected edge into a quad.
+    #[serde(default)]
+    pub quad: bool,
 }
 fn default_normal() -> V {
     V::Z
@@ -95,6 +101,8 @@ fn execute_on_surface(request: Request, surface: &Surface) -> Result<Mesh, Strin
         rows,
         factor,
         edge,
+        vertex,
+        quad,
     } = request;
     mesh.validate()?;
     if points.iter().any(|p| !p.is_finite()) {
@@ -168,12 +176,19 @@ fn execute_on_surface(request: Request, surface: &Surface) -> Result<Mesh, Strin
         }
         "patch" => construction::patch(&mut mesh, surface, &points, count, rows)?,
         "fill_patch" => fill::fill_patch(&mut mesh, surface, count, rows)?,
-        "polypen" => pen::insert(
+        "fill_auto" => {
+            fill::fill_auto(&mut mesh, surface)?;
+        }
+        "polypen" => pen::insert_with(
             &mut mesh,
             surface,
             *points.first().ok_or("PolyPen needs a point")?,
-            edge,
-            width,
+            &pen::PenOptions {
+                edge,
+                snap_distance: width,
+                vertex,
+                quad,
+            },
         )?,
         "merge" => pen::merge_selected(&mut mesh, surface)?,
         "polystrip" => construction::polystrip(&mut mesh, surface, &points, count, width)?,
@@ -226,12 +241,21 @@ fn execute_on_surface(request: Request, surface: &Surface) -> Result<Mesh, Strin
             } else {
                 None
             };
+            let sampled = match &boundary {
+                Some(ids) => {
+                    let positions: Vec<_> = ids.iter().map(|&i| mesh.vertices[i]).collect();
+                    construction::align(&positions, &sampled, closed)
+                }
+                None => sampled,
+            };
+            let first_new = mesh.faces.len();
             let ids = mesh.add_chain(&sampled, closed);
             if let Some(boundary) = boundary {
                 for i in 0..if closed { count } else { count - 1 } {
                     let j = (i + 1) % count;
                     mesh.add_face(vec![boundary[i], boundary[j], ids[j], ids[i]]);
                 }
+                construction::orient_new_faces(&mut mesh, first_new, surface);
             }
             mesh.selected = ids;
         }
@@ -392,6 +416,26 @@ mod tests {
         let result = execute(r).unwrap();
         assert_eq!(result.faces.len(), 1);
         assert_eq!(result.vertices.len(), 4);
+    }
+    #[test]
+    fn bridge_aligns_reversed_stroke() {
+        let mut r = request("bridge");
+        r.mesh = Mesh {
+            vertices: vec![V::ZERO, V::X, V::X * 2.0],
+            edges: vec![[0, 1], [1, 2]],
+            selected: vec![0, 1, 2],
+            ..Mesh::default()
+        };
+        // Drawn right-to-left, opposite the boundary order.
+        r.points = vec![V::new(2., 1., 1.), V::new(0., 1., 1.)];
+        r.count = 3;
+        let result = execute(r).unwrap();
+        assert_eq!(result.faces.len(), 2);
+        for f in &result.faces {
+            let [a, b, c] = [0, 1, 2].map(|i| result.vertices[f[i]]);
+            // Untwisted and oriented with the +Z source normal.
+            assert!((b - a).cross(c - a).z > 0.0, "{f:?}");
+        }
     }
     #[test]
     fn rejects_nonfinite_and_bad_closed_strokes() {
