@@ -7,9 +7,9 @@ when Python modules are reloaded. Keep runtime copies until process exit.
 """
 import atexit
 import ctypes
-from pathlib import Path
 import shutil
 import tempfile
+from pathlib import Path
 
 
 def load_runtime_copy(source):

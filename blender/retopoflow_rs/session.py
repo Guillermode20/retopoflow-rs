@@ -1,51 +1,55 @@
-"""One viewport session around the native tools, not a replacement RF renderer.
+"""Persistent viewport retopology session.
 
-The target is Blender's wire/in-front object. Preview lines are input gestures,
-not reconstructed geometry. Selection currently picks vertices, not edges/brushes.
+One modal operator owns the viewport while you retopologize: a HUD with tools
+and options, a custom target renderer that respects source occlusion, live
+brushes, per-action undo and the native Rust engine for topology changes.
+``Session`` is a plain class (the operator only forwards to it) so the whole
+state machine can be driven deterministically from headless tests.
 """
-import importlib
+import time
+from contextlib import contextmanager
+from types import SimpleNamespace
 
+import bmesh
 import bpy
-import blf
 import gpu
+import numpy as np
 from bpy.props import BoolProperty, EnumProperty
 from bpy_extras import view3d_utils
-from gpu_extras.batch import batch_for_shader
 from mathutils import Vector
 from mathutils.bvhtree import BVHTree
 
+from . import engine, gfx, hud
+from .hud import TOOLS
+from .target import TargetCache
+
 _SESSION = None
-TOOLS = ('Contours', 'PolyStrips', 'Strokes', 'Patches', 'PolyPen',
-         'Knife', 'Loops', 'Tweak', 'Relax', 'Select')
 KEYS = dict(zip(('ONE', 'TWO', 'THREE', 'FOUR', 'FIVE', 'SIX', 'SEVEN',
                  'EIGHT', 'NINE', 'ZERO'), TOOLS))
-OPERATIONS = {'PolyPen': 'polypen', 'Strokes': 'stroke', 'Contours': 'contour',
-              'PolyStrips': 'polystrip', 'Patches': 'patch', 'Loops': 'loops',
-              'Knife': 'knife', 'Relax': 'relax', 'Tweak': 'tweak'}
-OPTIONS = {
-    'Select': (), 'PolyPen': ('width',),
-    'Strokes': ('count', 'closed'), 'Contours': ('count',),
-    'PolyStrips': ('count', 'width'), 'Patches': ('count', 'rows'),
-    'Loops': ('factor',), 'Knife': (),
-    'Relax': ('strength', 'iterations'), 'Tweak': (),
+WHEEL = frozenset({'WHEELUPMOUSE', 'WHEELDOWNMOUSE'})
+NAVIGATION = frozenset({'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'TRACKPADPAN',
+                        'TRACKPADZOOM', 'NDOF_MOTION', 'HOME', 'ACCENT_GRAVE'})
+MOVES = frozenset({'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'})
+CURSORS = {'Select': 'DEFAULT', 'Knife': 'KNIFE', 'Tweak': 'HAND', 'Relax': 'PAINT_BRUSH'}
+COLORS = {
+    'face': (0.30, 0.68, 1.0, 0.16),
+    'edge': (0.62, 0.85, 1.0, 0.95),
+    'vertex': (0.88, 0.94, 1.0, 1.0),
+    'selected': (1.0, 0.60, 0.16, 1.0),
+    'hover': (1.0, 0.92, 0.30, 1.0),
+    'preview': (0.30, 0.78, 1.0, 1.0),
+    'preview_soft': (0.30, 0.78, 1.0, 0.35),
+    'box': (1.0, 1.0, 1.0, 0.85),
 }
-
-HELP = {
-    'Select': 'Click vertex; Shift-click toggles | A all / Alt-A none | Ctrl-I invert | Ctrl-L linked',
-    'PolyPen': 'Click to insert/snap; near an edge splits it | Shift-click selects | each click has its own undo',
-    'Strokes': 'Drag a stroke; release to commit | matching selected boundary extrudes quads',
-    'Contours': 'Drag a section plane; release to commit | matching selected boundary bridges',
-    'PolyStrips': 'Drag a centerline; release creates a ribbon | Width controls rail separation',
-    'Patches': 'Click four corners in perimeter order | F fills a matching selected boundary',
-    'Loops': 'Click target edge to insert a quad ring | Factor controls the split position',
-    'Knife': 'Drag a line; release cuts by an infinite view-perpendicular plane',
-    'Relax': 'Shift-click to select vertices; click to smooth selected interior vertices',
-    'Tweak': 'Shift-click to select vertices; drag to translate and project selection',
-}
+TOAST_SECONDS = 4.0
 
 
-def adapter():
-    return importlib.import_module(__package__)
+class SessionError(RuntimeError):
+    """The session cannot start or must end."""
+
+
+class UserError(ValueError):
+    """A gesture was rejected; shown as a toast while the session continues."""
 
 
 def active_session():
@@ -53,27 +57,22 @@ def active_session():
 
 
 def shutdown(context):
-    session = active_session()
-    if session is not None:
-        session._finish(context, False)
+    if _SESSION is not None:
+        _SESSION.finish(context, cancel=False)
 
 
-def _discard(mesh):
-    if mesh is not None:
-        try:
-            if mesh.users == 0:
-                bpy.data.meshes.remove(mesh)
-        except ReferenceError:
-            pass
+def falloff(x):
+    x = np.clip(np.asarray(x, dtype=np.float64), 0.0, 1.0)
+    return (1.0 - x * x) ** 2
 
 
 class SessionHistory:
-    """Owned mesh snapshots and ordered selection; no Blender global undo calls.
+    """Per-action undo with bmesh snapshots (no Blender datablocks are created).
 
-    begin/commit/rollback also make failed native operations transactional.
-    Snapshots are never installed directly: history retains ownership of them.
+    begin/commit/rollback make failed native operations transactional.
     """
-    def __init__(self, target, limit=32):
+
+    def __init__(self, target, limit=64):
         self.target = target
         self.limit = limit
         self.undo_stack = []
@@ -82,15 +81,22 @@ class SessionHistory:
         self.entry = self.capture()
 
     def capture(self):
-        return self.target.data.copy(), list(adapter()._selected(self.target))
+        snapshot = bmesh.new()
+        snapshot.from_mesh(self.target.data)
+        return snapshot, tuple(engine.selected(self.target))
 
     def restore(self, state):
-        mesh, selected = state
-        old = self.target.data
-        self.target.data = mesh.copy()
-        adapter()._set_selection(self.target.data, selected)
-        adapter()._remember_selection(self.target, selected)
-        _discard(old)
+        snapshot, order = state
+        mesh = self.target.data
+        if mesh.users > 1:
+            mesh = self.target.data = mesh.copy()
+        snapshot.to_mesh(mesh)
+        mesh.update()
+        engine.remember_selection(self.target, order)
+
+    @staticmethod
+    def _free(state):
+        state[0].free()
 
     def begin(self):
         if self.pending is not None:
@@ -104,7 +110,13 @@ class SessionHistory:
         self.pending = None
         self.clear_stack(self.redo_stack)
         while len(self.undo_stack) > self.limit:
-            _discard(self.undo_stack.pop(0)[0])
+            self._free(self.undo_stack.pop(0))
+
+    def discard(self):
+        """Drop the pending snapshot when nothing changed."""
+        if self.pending is not None:
+            self._free(self.pending)
+            self.pending = None
 
     def rollback(self):
         if self.pending is not None:
@@ -112,7 +124,7 @@ class SessionHistory:
             try:
                 self.restore(state)
             finally:
-                _discard(state[0])
+                self._free(state)
 
     def step(self, redo=False):
         self.rollback()
@@ -121,21 +133,18 @@ class SessionHistory:
         if not source:
             return False
         current = self.capture()
-        state = source[-1]
         try:
-            self.restore(state)
+            self.restore(source[-1])
         except Exception:
-            _discard(current[0])
+            self._free(current)
             raise
-        source.pop()
+        self._free(source.pop())
         destination.append(current)
-        _discard(state[0])
         return True
 
-    @staticmethod
-    def clear_stack(stack):
-        for mesh, _ in stack:
-            _discard(mesh)
+    def clear_stack(self, stack):
+        for state in stack:
+            self._free(state)
         stack.clear()
 
     def close(self, cancel=False):
@@ -144,14 +153,1165 @@ class SessionHistory:
                 self.restore(self.entry)
         finally:
             if self.pending is not None:
-                _discard(self.pending[0])
+                self._free(self.pending)
                 self.pending = None
             self.clear_stack(self.undo_stack)
             self.clear_stack(self.redo_stack)
-            _discard(self.entry[0])
+            self._free(self.entry)
+
+
+def _is_target(obj):
+    return bool(getattr(obj, 'rf_rs_is_target', False))
+
+
+def _has_surface(obj):
+    return obj.type == 'MESH' and (len(obj.data.polygons) or len(obj.modifiers))
+
+
+class Session:
+    def __init__(self, context, tool='Select', new_target=False, report=None):
+        global _SESSION
+        if _SESSION is not None:
+            raise SessionError('A Retopo RS session is already active')
+        self.report = report or (lambda kind, message: None)
+        self.tool = tool if tool in TOOLS else 'Select'
+        self.finished = False
+        self.created = None
+        self.target = None
+        self.sources = ()
+        self.history = None
+        self.cache = None
+        self.source_handle = None
+        self.handles = []
+        self.timer = None
+        self.restorers = []
+        self.gesture = None
+        self.corners = []
+        self.hover = None
+        self.hover_widget = None
+        self.mouse = (0.0, 0.0)
+        self.toasts = []
+        self.show_help = False
+        self.pen_triangle = None
+        self.discard_armed = 0.0
+        self.cursor = None
+        self.render_failed = False
+        self.batch_key = None
+        self.batches = {}
+        _SESSION = self
+        try:
+            self._start(context, new_target)
+        except Exception:
+            self.finish(context, cancel=True)
+            raise
+
+    # ------------------------------------------------------------ lifecycle
+    def _start(self, context, new_target):
+        if context.area is None or context.area.type != 'VIEW_3D':
+            raise SessionError('Start in a 3D viewport')
+        obj = context.active_object
+        if obj is None or obj.type != 'MESH' or context.mode not in {'OBJECT', 'EDIT_MESH'}:
+            raise SessionError('Start with an active mesh in Object or Edit Mode')
+        if obj.library or obj.data.library:
+            raise SessionError('Target must be editable')
+        self.area = context.area
+        self.space = context.space_data
+        self.region = next((r for r in self.area.regions if r.type == 'WINDOW'), None)
+        if self.region is None:
+            raise SessionError('Viewport has no window region')
+        self.rv3d = self.space.region_3d
+        self.window = context.window
+        self.workspace = context.workspace
+        self.scene = context.scene
+        self.view_layer = context.view_layer
+        self.original_active = obj
+        self.original_selected = list(context.selected_objects)
+        self.original_mode = context.mode
+        if context.mode == 'EDIT_MESH':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        explicit = self.scene.rf_rs_source
+        remembered = self.scene.rf_rs_target
+        if remembered is not None and (remembered.type != 'MESH' or remembered.name not in self.view_layer.objects
+                                       or remembered.library or remembered.data.library):
+            remembered = None
+        others = [o for o in context.visible_objects if o != obj and _has_surface(o) and not _is_target(o)]
+        active_is_source = (obj == explicit or (not _is_target(obj) and self.original_mode == 'OBJECT'
+                                                and len(obj.data.polygons) and not others and explicit is None))
+        if new_target:
+            self.target = self._create_target(context)
+        elif active_is_source:
+            # Continue the target last used for this scene instead of piling up new ones.
+            self.target = remembered if remembered is not None and remembered != obj else self._create_target(context)
+        else:
+            self.target = obj
+
+        if explicit is not None and explicit != self.target and explicit.type == 'MESH':
+            candidates = [explicit]
+        else:
+            candidates = [o for o in context.visible_objects
+                          if o != self.target and _has_surface(o) and not _is_target(o)]
+            if obj not in candidates and obj != self.target and _has_surface(obj) and not _is_target(obj):
+                candidates.append(obj)
+        if not candidates:
+            raise SessionError('No source mesh found. Pick the high-poly object in Source, '
+                               'or select it in Object Mode and press Retopo RS.')
+        vertices, triangles, usable, warnings, skipped = [], [], [], [], 0
+        for source in candidates:
+            try:
+                data = engine.source_geometry(context, source)
+            except RuntimeError as exc:
+                if source == explicit:
+                    raise
+                warnings.append(str(exc))
+                continue
+            usable.append(source)
+            skipped += data['skipped_triangles']
+            offset = len(vertices)
+            vertices.extend(data['vertices'])
+            triangles.extend([[i + offset for i in tri] for tri in data['triangles']])
+        if not triangles:
+            raise SessionError('No usable source surfaces. ' + '; '.join(warnings))
+        self.sources = tuple(usable)
+        self.source = {'vertices': vertices, 'triangles': triangles}
+        self.bvh = BVHTree.FromPolygons(vertices, triangles, all_triangles=True)
+        self.source_handle = engine.cache_source(self.source)
+        self.history = SessionHistory(self.target)
+        self.cache = TargetCache(self.target).refresh()
+        if skipped or warnings:
+            parts = []
+            if skipped:
+                parts.append(f'skipped {skipped} zero-area triangles')
+            if warnings:
+                parts.append(f'ignored {len(warnings)} unusable meshes')
+            self.toast('Source cleanup: ' + ', '.join(parts), 'warning')
+
+        # Viewport state changes happen only once everything above succeeded.
+        self.target.rf_rs_is_target = True
+        self.scene.rf_rs_target = self.target
+        for selected in context.selected_objects:
+            selected.select_set(False)
+        self.target.select_set(True)
+        self.view_layer.objects.active = self.target
+        hidden = self.target.hide_get()
+        self.target.hide_set(True)   # drawn by our renderer instead
+        self.restorers.append(lambda: self.target.hide_set(hidden))
+        self._set(self.space, 'show_gizmo', False)
+        self._set(self.space.overlay, 'show_text', False)
+        self._set(self.space.overlay, 'show_stats', False)
+        for name in ('show_region_ui', 'show_region_toolbar', 'show_region_tool_header'):
+            self._set(self.space, name, False)
+        self.handles.append(bpy.types.SpaceView3D.draw_handler_add(self.draw_3d, (), 'WINDOW', 'POST_VIEW'))
+        self.handles.append(bpy.types.SpaceView3D.draw_handler_add(self.draw_2d, (), 'WINDOW', 'POST_PIXEL'))
+        self.workspace.status_text_set('Retopo RS  ·  1–0 tools  ·  F1 help  ·  Tab finish  ·  Shift Esc discard')
+        manager = getattr(context, 'window_manager', None)
+        if manager is not None and hasattr(manager, 'event_timer_add') and self.window is not None:
+            self.timer = manager.event_timer_add(1 / 30, window=self.window)
+        self._set_cursor()
+        self.area.tag_redraw()
+
+    def _create_target(self, context):
+        mesh = bpy.data.meshes.new('Retopo Target')
+        self.created = bpy.data.objects.new('Retopo Target', mesh)
+        context.collection.objects.link(self.created)
+        self.created.rf_rs_is_target = True
+        # Keeps the retopology readable over the source after the session too.
+        self.created.show_in_front = True
+        return self.created
+
+    def _set(self, owner, name, value):
+        if not hasattr(owner, name):
+            return
+        previous = getattr(owner, name)
+        # Region visibility setters can toggle even when assigned their
+        # current value; avoid redundant writes on entry and restoration.
+        if previous == value:
+            return
+        setattr(owner, name, value)
+
+        def restore(owner=owner, name=name, previous=previous):
+            if getattr(owner, name) != previous:
+                setattr(owner, name, previous)
+        self.restorers.append(restore)
+
+    def finish(self, context, cancel=False):
+        global _SESSION
+        if self.finished:
+            return
+        self.finished = True
+        self.gesture = None
+        try:
+            if self.history is not None:
+                try:
+                    self.history.close(cancel)
+                except (ReferenceError, RuntimeError):
+                    pass
+            if cancel and self.created is not None:
+                try:
+                    mesh = self.created.data
+                    bpy.data.objects.remove(self.created, do_unlink=True)
+                    if mesh.users == 0:
+                        bpy.data.meshes.remove(mesh)
+                except ReferenceError:
+                    pass
+        finally:
+            for handle in self.handles:
+                try:
+                    bpy.types.SpaceView3D.draw_handler_remove(handle, 'WINDOW')
+                except (ValueError, ReferenceError):
+                    pass
+            self.handles.clear()
+            if self.source_handle:
+                try:
+                    engine.free_source(self.source_handle)
+                except Exception:
+                    pass
+                self.source_handle = None
+            if self.timer is not None:
+                try:
+                    context.window_manager.event_timer_remove(self.timer)
+                except Exception:
+                    pass
+                self.timer = None
+            if self.cursor is not None:
+                try:
+                    self.window.cursor_modal_restore()
+                except Exception:
+                    pass
+                self.cursor = None
+            for restore in reversed(self.restorers):
+                try:
+                    restore()
+                except (ReferenceError, RuntimeError, AttributeError):
+                    pass
+            self.restorers.clear()
+            self._restore_selection(context, cancel)
+            try:
+                self.scene.rf_rs_tool = self.tool
+            except Exception:
+                pass
+            try:
+                self.workspace.status_text_set(None)
+                self.area.tag_redraw()
+            except (ReferenceError, AttributeError):
+                pass
+            if _SESSION is self:
+                _SESSION = None
+
+    def _restore_selection(self, context, cancel):
+        view_layer = getattr(self, 'view_layer', None)
+        if view_layer is None:
+            return
+        try:
+            for obj in view_layer.objects:
+                obj.select_set(False)
+            if not cancel and self.created is not None:
+                # New-target sessions finish on the retopology, not the source.
+                self.target.select_set(True)
+                view_layer.objects.active = self.target
+                return_to_edit = True
+            else:
+                for obj in self.original_selected:
+                    try:
+                        obj.select_set(True)
+                    except (ReferenceError, RuntimeError):
+                        pass
+                view_layer.objects.active = self.original_active
+                return_to_edit = self.original_mode == 'EDIT_MESH'
+            if return_to_edit:
+                with context.temp_override(window=self.window, area=self.area):
+                    if context.mode == 'OBJECT':
+                        bpy.ops.object.mode_set(mode='EDIT')
+        except (ReferenceError, RuntimeError, TypeError):
+            pass
+
+    # ---------------------------------------------------------------- utils
+    @property
+    def scale(self):
+        try:
+            # 0.0 in background mode, where there is no display.
+            return bpy.context.preferences.system.ui_scale or 1.0
+        except AttributeError:
+            return 1.0
+
+    def toast(self, message, kind='info'):
+        self.toasts = [t for t in self.toasts if t[0] != message][-2:]
+        self.toasts.append((message, kind, time.monotonic() + TOAST_SECONDS))
+        if kind in ('error', 'warning'):
+            self.report({'WARNING'}, message)
+        self._redraw()
+
+    def _redraw(self):
+        try:
+            self.area.tag_redraw()
+        except (ReferenceError, AttributeError):
+            pass
+
+    def _coordinate(self, event):
+        return float(event.mouse_x - self.region.x), float(event.mouse_y - self.region.y)
+
+    def _overlapping_regions(self):
+        win = self.region
+        for region in self.area.regions:
+            if region.type == 'WINDOW' or region.width <= 1 or region.height <= 1:
+                continue
+            if (region.x >= win.x + win.width or region.x + region.width <= win.x or
+                    region.y >= win.y + win.height or region.y + region.height <= win.y):
+                continue
+            yield region
+
+    def insets(self):
+        """Pixels of the window region covered by overlapping header/toolbar/sidebar.
+
+        Floating regions (the operator redo panel) and hidden ones do not count.
+        """
+        win = self.region
+        left = right = top = bottom = 0
+        for region in self._overlapping_regions():
+            align = getattr(region, 'alignment', 'NONE')
+            if align == 'TOP':
+                top = max(top, win.y + win.height - region.y)
+            elif align == 'BOTTOM':
+                bottom = max(bottom, region.y + region.height - win.y)
+            elif align == 'LEFT':
+                left = max(left, region.x + region.width - win.x)
+            elif align == 'RIGHT':
+                right = max(right, win.x + win.width - region.x)
+        return left, right, top, bottom
+
+    def _in_viewport(self, event):
+        x, y = event.mouse_x, event.mouse_y
+        win = self.region
+        if not (win.x <= x < win.x + win.width and win.y <= y < win.y + win.height):
+            return False
+        return not any(r.x <= x < r.x + r.width and r.y <= y < r.y + r.height
+                       for r in self._overlapping_regions())
+
+    def _hit(self, xy):
+        origin = view3d_utils.region_2d_to_origin_3d(self.region, self.rv3d, Vector(xy))
+        direction = view3d_utils.region_2d_to_vector_3d(self.region, self.rv3d, Vector(xy))
+        return self.bvh.ray_cast(origin, direction)[0]
+
+    def _pixels_to_world(self, pixels, point):
+        screen = view3d_utils.location_3d_to_region_2d(self.region, self.rv3d, point)
+        if screen is None:
+            raise UserError('Stroke starts behind the view')
+        other = view3d_utils.region_2d_to_location_3d(self.region, self.rv3d, screen + Vector((pixels, 0)), point)
+        return max((other - point).length, 1e-6)
+
+    def _set_cursor(self, over_hud=False):
+        name = 'DEFAULT' if over_hud else CURSORS.get(self.tool, 'CROSSHAIR')
+        if name == self.cursor or self.window is None:
+            return
+        try:
+            self.window.cursor_modal_set(name)
+            self.cursor = name
+        except Exception:
+            pass
+
+    def _context_ok(self, context):
+        try:
+            return (context.area == self.area and self.area.type == 'VIEW_3D' and context.mode == 'OBJECT'
+                    and context.view_layer.objects.active == self.target
+                    and self.target.name in context.view_layer.objects)
+        except ReferenceError:
+            return False
+
+    # ------------------------------------------------------------- mutation
+    @contextmanager
+    def transaction(self):
+        self.history.begin()
+        try:
+            yield
+        except BaseException:
+            self.history.rollback()
+            raise
+        else:
+            self.history.commit()
+        finally:
+            self.cache.invalidate()
+            self._redraw()
+
+    def run(self, context, operation, points=(), extra=None, selection=None):
+        """One native call inside an open transaction."""
+        return engine.execute(context, operation, points, self.target, self.source, extra,
+                              self.source_handle, selection)
+
+    def mutate(self, context, operation, points=(), extra=None, selection=None):
+        with self.transaction():
+            return self.run(context, operation, points, extra, selection)
+
+    def apply_selection(self, order):
+        order = [int(i) for i in order]
+        with self.transaction():
+            if self.target.data.users > 1:
+                self.target.data = self.target.data.copy()
+            engine.set_selection(self.target.data, order)
+            engine.remember_selection(self.target, order)
+
+    def set_tool(self, tool):
+        if tool == self.tool:
+            return
+        self.cancel_gesture()
+        self.tool = tool
+        self.hover = None
+        self._set_cursor()
+        self._redraw()
+
+    def cancel_gesture(self):
+        gesture, self.gesture = self.gesture, None
+        self.corners = []
+        if gesture is not None and getattr(gesture, 'transaction', False):
+            self.history.rollback()
+            self.cache.invalidate()
+        self._redraw()
+
+    def undo(self, redo=False):
+        self.cancel_gesture()
+        if self.history.step(redo):
+            self.cache.invalidate()
+            self.pen_triangle = None
+            self.toast('Redo' if redo else 'Undo')
+        else:
+            self.toast('Nothing to redo' if redo else 'Nothing to undo')
+
+    def adjust(self, name, direction):
+        prop, _, kind, step = hud.OPTIONS[name]
+        value = getattr(self.scene, prop)
+        if kind == 'bool':
+            setattr(self.scene, prop, not value)
+        else:
+            setattr(self.scene, prop, value + direction * step)
+        self._redraw()
+
+    # -------------------------------------------------------------- the HUD
+    def frame(self):
+        cache = self.cache.ensure()
+        names = hud.TOOL_OPTIONS.get(self.tool, ())
+        now = time.monotonic()
+        self.toasts = [t for t in self.toasts if t[2] > now]
+        toasts = tuple((message, kind, max(0.0, min(1.0, (expires - now) / 0.4)))
+                       for message, kind, expires in reversed(self.toasts))
+        view = hud.View(
+            width=self.region.width, height=self.region.height, insets=self.insets(),
+            scale=self.scale, tool=self.tool,
+            options={n: getattr(self.scene, hud.OPTIONS[n][0]) for n in names},
+            stats=(f'{cache.count} v  ·  {len(cache.edges)} e  ·  {len(cache.faces)} f'
+                   f'  ·  {int(cache.selected.sum())} sel'),
+            target=self.target.name, hint=self.hint(),
+            can_undo=bool(self.history.undo_stack), can_redo=bool(self.history.redo_stack),
+            toasts=toasts, show_help=self.show_help)
+        return hud.layout(view)
+
+    def hint(self):
+        tool, cache = self.tool, self.cache.ensure()
+        selection = cache.order
+        boundary = cache.selected_boundary()
+        if tool == 'Select':
+            return 'Click select  ·  Shift toggle  ·  Drag box  ·  Ctrl-drag deselect  ·  Ctrl L linked'
+        if tool == 'PolyPen':
+            if self.pen_triangle is not None and self.pen_triangle == self._pen_key(selection):
+                return 'Click to complete the quad  ·  Ctrl-click starts a new chain'
+            if len(selection) == 2 and cache.has_edge(*selection):
+                return 'Click to add a triangle off the selected edge  ·  Ctrl-click new chain'
+            if len(selection) == 1:
+                return 'Click to extend the chain  ·  click a vertex to connect  ·  Ctrl-click new chain'
+            return 'Click to place a vertex  ·  click an edge to split it  ·  Shift-click selects'
+        if tool in ('Strokes', 'Contours'):
+            if boundary is not None:
+                kind = 'loop' if boundary[1] else 'chain'
+                verb = 'Draw beside' if tool == 'Strokes' else 'Drag across the form near'
+                return f'{verb} the selected {kind} ({boundary[0]} verts) to bridge it  ·  Ctrl-drag: separate'
+            if tool == 'Strokes':
+                return 'Drag a stroke on the surface  ·  end near the start to close it'
+            return 'Drag a line across the form to add a ring  ·  Ctrl-wheel: segments'
+        if tool == 'PolyStrips':
+            return 'Drag along the surface to paint a strip  ·  Ctrl-wheel: width'
+        if tool == 'Patches':
+            if self.corners:
+                return f'Corner {len(self.corners)}/4  ·  click the next corner  ·  Backspace removes one'
+            if boundary is not None and boundary[1]:
+                return f'Press F to fill the selected loop ({boundary[0]} verts)  ·  or click four corners'
+            return 'Click four corners in order  ·  F fills a selected boundary loop'
+        if tool == 'Knife':
+            return 'Drag a line across faces to cut them'
+        if tool == 'Loops':
+            return 'Hover an edge and click to insert a loop' + (
+                ' at the center' if self.scene.rf_rs_loop_center else ' where you click')
+        if tool == 'Tweak':
+            return 'Drag to move vertices under the brush  ·  Ctrl-wheel: radius'
+        if tool == 'Relax':
+            return 'Hold and brush to relax vertices  ·  boundaries stay fixed  ·  Ctrl-wheel: radius'
+        return ''
+
+    def activate(self, context, widget):
+        kind, value = widget.kind, widget.value
+        if kind == 'tool':
+            self.set_tool(value)
+        elif kind == 'step':
+            self.adjust(*value)
+        elif kind in ('toggle', 'option'):
+            if hud.OPTIONS[value][2] == 'bool':
+                self.adjust(value, 1)
+        elif kind == 'action' and widget.enabled:
+            if value in ('undo', 'redo'):
+                self.undo(redo=value == 'redo')
+            elif value == 'help':
+                self.show_help = not self.show_help
+            elif value == 'finish':
+                self.finish(context)
+                return {'FINISHED'}
+            elif value == 'cancel':
+                if time.monotonic() < self.discard_armed:
+                    self.finish(context, cancel=True)
+                    return {'CANCELLED'}
+                self.discard_armed = time.monotonic() + 3.0
+                self.toast('Click Discard again to throw away this session', 'warning')
+        self._redraw()
+        return None
+
+    # ------------------------------------------------------------ the modal
+    def modal(self, context, event):
+        if self.finished:
+            return {'FINISHED'}
+        try:
+            return self._modal(context, event)
+        except UserError as exc:
+            self.cancel_gesture()
+            self.toast(str(exc), 'warning')
+            return {'RUNNING_MODAL'}
+        except (engine.EngineError, RuntimeError) as exc:
+            if isinstance(exc, SessionError) or not self._context_ok(context):
+                self.report({'WARNING'}, str(exc))
+                self.finish(context)
+                return {'FINISHED'}
+            self.cancel_gesture()
+            self.toast(str(exc), 'error')
+            return {'RUNNING_MODAL'}
+        except Exception as exc:
+            self.report({'ERROR'}, f'Retopo RS: {exc}')
+            self.finish(context)
+            return {'FINISHED'}
+
+    def _modal(self, context, event):
+        if not self._context_ok(context):
+            raise SessionError('Session context changed; ending session')
+        kind, value = event.type, event.value
+        press = value == 'PRESS'
+        ctrl = event.ctrl or getattr(event, 'oskey', False)
+        if kind == 'TIMER':
+            self.tick(context)
+            return {'PASS_THROUGH'}
+        if ctrl and kind == 'S':
+            self.toast('Finish the session (Tab) before saving', 'warning')
+            return {'RUNNING_MODAL'}
+        if press and kind == 'ESC' and event.shift:
+            self.finish(context, cancel=True)
+            return {'CANCELLED'}
+        if press and kind in {'ESC', 'RIGHTMOUSE'}:
+            if self.gesture is not None or self.corners:
+                self.cancel_gesture()
+            elif self.show_help:
+                self.show_help = False
+                self._redraw()
+            elif kind == 'ESC':
+                self.finish(context)
+                return {'FINISHED'}
+            return {'RUNNING_MODAL'}
+        if press and kind == 'F1':
+            self.show_help = not self.show_help
+            self._redraw()
+            return {'RUNNING_MODAL'}
+        if ctrl and kind in {'Z', 'Y'}:
+            if press:
+                self.undo(redo=kind == 'Y' or event.shift)
+            return {'RUNNING_MODAL'}
+
+        xy = self._coordinate(event)
+        if self.gesture is not None:
+            # Drags keep tracking past the viewport edge and always finish.
+            if kind in MOVES:
+                self.mouse = xy
+                self.gesture_move(context)
+                self._redraw()
+            elif kind == 'LEFTMOUSE' and value == 'RELEASE':
+                self.mouse = xy
+                self.gesture_release(context)
+            return {'RUNNING_MODAL'}
+        if not self._in_viewport(event):
+            if self.hover_widget is not None or self.hover is not None:
+                self.hover_widget = self.hover = None
+                self._redraw()
+            self._set_cursor(over_hud=True)
+            return {'PASS_THROUGH'}
+
+        self.mouse = xy
+        frame = self.frame()
+        widget = frame.widget_at(*xy)
+        over_hud = frame.over_hud(*xy)
+        if kind in MOVES:
+            self.hover_widget = widget
+            self.hover = None if over_hud else self.compute_hover()
+            self._set_cursor(over_hud)
+            self._redraw()
+            return {'RUNNING_MODAL'}
+        if over_hud:
+            if widget is not None and press and kind == 'LEFTMOUSE':
+                return self.activate(context, widget) or {'RUNNING_MODAL'}
+            if widget is not None and kind in WHEEL and widget.kind in ('option', 'step', 'toggle'):
+                name = widget.value[0] if widget.kind == 'step' else widget.value
+                self.adjust(name, 1 if kind == 'WHEELUPMOUSE' else -1)
+            return {'RUNNING_MODAL'}
+        if press and self.shortcut(context, event):
+            return {'RUNNING_MODAL'}
+        if ctrl and kind in WHEEL and self.tool in hud.PRIMARY_OPTION:
+            self.adjust(hud.PRIMARY_OPTION[self.tool], 1 if kind == 'WHEELUPMOUSE' else -1)
+            return {'RUNNING_MODAL'}
+        if self._is_navigation(event):
+            return {'PASS_THROUGH'}
+        if kind == 'LEFTMOUSE' and press:
+            self.press(context, event)
+        return {'RUNNING_MODAL'}
+
+    @staticmethod
+    def _is_navigation(event):
+        kind = event.type
+        return (kind in NAVIGATION or kind.startswith('NDOF_') or
+                (kind.startswith('NUMPAD_') and kind != 'NUMPAD_ENTER') or
+                (event.alt and kind == 'LEFTMOUSE'))
+
+    def shortcut(self, context, event):
+        kind = event.type
+        ctrl = event.ctrl or getattr(event, 'oskey', False)
+        if kind in KEYS and not ctrl and not event.alt:
+            self.set_tool(KEYS[kind])
+            return True
+        if kind == 'W' and not ctrl:
+            self.set_tool('Select')
+            return True
+        if kind in {'RET', 'NUMPAD_ENTER', 'TAB'}:
+            self.finish(context)
+            return True
+        if kind == 'BACK_SPACE' and self.corners:
+            self.corners.pop()
+            self._redraw()
+            return True
+        cache = self.cache.ensure()
+        if kind == 'A' and not ctrl:
+            self.apply_selection([] if event.alt else range(cache.count))
+            return True
+        if kind == 'I' and ctrl:
+            self.apply_selection(np.flatnonzero(~cache.selected).tolist())
+            return True
+        if kind == 'L' and ctrl:
+            if not cache.order:
+                raise UserError('Select a vertex first')
+            self.apply_selection(cache.linked(cache.order))
+            return True
+        if kind == 'M' and not ctrl:
+            self.mutate(context, 'merge')
+            return True
+        if kind == 'F' and not ctrl:
+            self.fill(context)
+            return True
+        if kind in {'X', 'DEL'} and not ctrl:
+            if not cache.order:
+                raise UserError('Nothing selected to delete')
+            self.mutate(context, 'delete')
+            return True
+        return False
+
+    def fill(self, context):
+        cache = self.cache.ensure()
+        boundary = cache.selected_boundary()
+        if boundary is None or not boundary[1]:
+            raise UserError('Select a closed boundary loop to fill (every vertex of it)')
+        self.mutate(context, 'fill_auto')
+        self.toast(f'Filled a {boundary[0]}-vertex loop')
+
+    def tick(self, context):
+        now = time.monotonic()
+        if any(t[2] - now < 0.5 for t in self.toasts):
+            self._redraw()
+        gesture = self.gesture
+        if gesture is not None and gesture.kind == 'relax' and now - gesture.last >= 1 / 30:
+            self.relax_step()
+
+    # ----------------------------------------------------------- hovering
+    def compute_hover(self):
+        cache = self.cache.ensure()
+        s = self.scale
+        tool = self.tool
+        if tool == 'PolyPen':
+            return self.pen_target(self.mouse)
+        if tool == 'Select':
+            vertex = cache.nearest_vertex(self.mouse, 14 * s, self.region, self.rv3d, self.bvh)
+            if vertex is not None:
+                return {'kind': 'vertex', 'vertex': vertex}
+            edge = cache.nearest_edge(self.mouse, 8 * s, self.region, self.rv3d, self.bvh)
+            return {'kind': 'edge', 'edge': edge[0]} if edge else None
+        if tool == 'Loops':
+            edge = cache.nearest_edge(self.mouse, 16 * s, self.region, self.rv3d, self.bvh)
+            if edge is None:
+                return None
+            factor = 0.5 if self.scene.rf_rs_loop_center else min(max(edge[1], 0.05), 0.95)
+            return {'kind': 'loop', 'edge': edge[0], 'factor': factor,
+                    'ring': cache.loop_ring(edge[0], factor)}
+        if tool in ('Patches', 'Strokes', 'PolyStrips'):
+            hit = self._hit(self.mouse)
+            return {'kind': 'surface', 'point': hit} if hit is not None else None
+        return None
+
+    def pen_target(self, xy):
+        cache = self.cache.ensure()
+        s = self.scale
+        vertex = cache.nearest_vertex(xy, 12 * s, self.region, self.rv3d, self.bvh)
+        if vertex is not None:
+            return {'kind': 'vertex', 'vertex': vertex, 'point': Vector(cache.world[vertex])}
+        edge = cache.nearest_edge(xy, 6 * s, self.region, self.rv3d, self.bvh)
+        if edge is not None:
+            a, b = cache.edges[edge[0]].tolist()
+            point = Vector(cache.world[a] + (cache.world[b] - cache.world[a]) * edge[1])
+            return {'kind': 'edge', 'edge': edge[0], 'point': point}
+        hit = self._hit(xy)
+        return {'kind': 'surface', 'point': hit} if hit is not None else None
+
+    # ------------------------------------------------------------ gestures
+    def press(self, context, event):
+        tool = self.tool
+        ctrl = event.ctrl or getattr(event, 'oskey', False)
+        xy = self.mouse
+        if event.shift and tool not in ('Select',):
+            self.click_select(xy, 'toggle')
+            return
+        if tool == 'Select':
+            mode = 'remove' if ctrl else ('toggle' if event.shift else 'set')
+            self.gesture = SimpleNamespace(kind='select', start=xy, mode=mode)
+        elif tool == 'PolyPen':
+            self.pen_click(context, new_chain=ctrl)
+        elif tool == 'Patches':
+            self.patch_corner(context)
+        elif tool == 'Loops':
+            self.loop_click(context)
+        elif tool in ('Strokes', 'PolyStrips'):
+            hit = self._hit(xy)
+            if hit is None:
+                raise UserError('Start the stroke on the source surface')
+            self.gesture = SimpleNamespace(kind='stroke', points=[hit], screen=[xy], separate=ctrl)
+        elif tool in ('Contours', 'Knife'):
+            self.gesture = SimpleNamespace(kind='line', screen=[xy, xy], separate=ctrl)
+        elif tool in ('Tweak', 'Relax'):
+            self.brush_begin()
+
+    def gesture_move(self, context):
+        g, xy = self.gesture, self.mouse
+        if g.kind == 'stroke':
+            if (Vector(xy) - Vector(g.screen[-1])).length >= 3 * self.scale:
+                hit = self._hit(xy)
+                if hit is not None and (hit - g.points[-1]).length > 1e-9:
+                    g.points.append(hit)
+                    g.screen.append(xy)
+        elif g.kind == 'line':
+            g.screen[1] = xy
+        elif g.kind == 'tweak':
+            self.tweak_move()
+        elif g.kind == 'relax':
+            self.relax_step()
+
+    def gesture_release(self, context):
+        g = self.gesture
+        if g.kind == 'select':
+            self.gesture = None
+            if (Vector(self.mouse) - Vector(g.start)).length < 4 * self.scale:
+                self.click_select(self.mouse, g.mode)
+            else:
+                self.box_select(g.start, self.mouse, g.mode)
+        elif g.kind == 'stroke':
+            self.gesture = None
+            self.commit_stroke(context, g)
+        elif g.kind == 'line':
+            self.gesture = None
+            self.commit_line(context, g)
+        elif g.kind in ('tweak', 'relax'):
+            self.gesture = None
+            if g.moved:
+                self.history.commit()
+            else:
+                self.history.discard()
+            self.cache.invalidate()
+        self._redraw()
+
+    # ------------------------------------------------------------ selection
+    def click_select(self, xy, mode):
+        cache = self.cache.ensure()
+        s = self.scale
+        vertex = cache.nearest_vertex(xy, 14 * s, self.region, self.rv3d, self.bvh)
+        picked = [vertex] if vertex is not None else []
+        if not picked:
+            edge = cache.nearest_edge(xy, 8 * s, self.region, self.rv3d, self.bvh)
+            if edge is not None:
+                picked = cache.edges[edge[0]].tolist()
+        order = list(cache.order)
+        if mode == 'set':
+            order = picked
+        elif mode == 'remove':
+            order = [i for i in order if i not in picked]
+        elif picked and all(p in order for p in picked):
+            order = [i for i in order if i not in picked]
+        else:
+            order += [p for p in picked if p not in order]
+        if order != list(cache.order):
+            self.apply_selection(order)
+
+    def box_select(self, a, b, mode):
+        cache = self.cache.ensure()
+        inside = cache.in_rect(np.asarray(a), np.asarray(b), self.region, self.rv3d, self.bvh)
+        order = list(cache.order)
+        if mode == 'set':
+            order = inside
+        elif mode == 'remove':
+            drop = set(inside)
+            order = [i for i in order if i not in drop]
+        else:
+            order += [i for i in inside if i not in set(order)]
+        if order != list(cache.order):
+            self.apply_selection(order)
+
+    # --------------------------------------------------------------- tools
+    def _pen_key(self, order):
+        cache = self.cache.ensure()
+        return cache.count, len(cache.faces), tuple(order)
+
+    def pen_click(self, context, new_chain=False):
+        cache = self.cache.ensure()
+        order = [] if new_chain else list(cache.order)
+        note = None
+        if len(order) > 2 or (len(order) == 2 and not cache.has_edge(*order)):
+            order = []
+            note = 'Started a new chain: PolyPen extends one vertex or one edge'
+        target = self.pen_target(self.mouse)
+        if target is None:
+            raise UserError('Click on the source surface')
+        quad = bool(self.scene.rf_rs_pen_quads and len(order) == 2 and
+                    self.pen_triangle == self._pen_key(order))
+        faces_before = len(cache.faces)
+        point = target['point']
+        with self.transaction():
+            if target['kind'] == 'edge':
+                a, b = cache.edges[target['edge']].tolist()
+                result = self.run(context, 'polypen', [point], {'edge': [a, b], 'width': 0.0}, order)
+                if order:
+                    split = result['selected'][0]
+                    self.run(context, 'polypen', [point], {'vertex': split, 'width': 0.0}, order)
+            else:
+                extra = {'width': 0.0, 'quad': quad}
+                if target['kind'] == 'vertex':
+                    extra['vertex'] = target['vertex']
+                self.run(context, 'polypen', [point], extra, order)
+        cache = self.cache.ensure()
+        made_triangle = (not quad and len(cache.faces) == faces_before + 1 and len(cache.order) == 2
+                         and len(cache.faces[-1]) == 3)
+        self.pen_triangle = self._pen_key(cache.order) if made_triangle else None
+        self.hover = self.compute_hover()
+        if note:
+            self.toast(note)
+
+    def patch_corner(self, context):
+        cache = self.cache.ensure()
+        vertex = cache.nearest_vertex(self.mouse, 12 * self.scale, self.region, self.rv3d, self.bvh)
+        point = Vector(cache.world[vertex]) if vertex is not None else self._hit(self.mouse)
+        if point is None:
+            raise UserError('Click corners on the source surface')
+        self.corners.append(point)
+        if len(self.corners) == 4:
+            corners, self.corners = self.corners, []
+            self.mutate(context, 'patch', corners)
+        self._redraw()
+
+    def loop_click(self, context):
+        hover = self.compute_hover()
+        if hover is None:
+            raise UserError('Click on an edge of a quad strip or ring')
+        a, b = self.cache.edges[hover['edge']].tolist()
+        self.mutate(context, 'loops', extra={'edge': [a, b], 'factor': hover['factor']})
+        self.hover = self.compute_hover()
+
+    def commit_stroke(self, context, g):
+        if len(g.points) < 2:
+            raise UserError('Draw a longer stroke on the surface')
+        cache = self.cache.ensure()
+        if self.tool == 'PolyStrips':
+            width = self._pixels_to_world(self.scene.rf_rs_strip_px, g.points[0])
+            self.mutate(context, 'polystrip', g.points, {'width': width})
+            return
+        boundary = None if g.separate else cache.selected_boundary()
+        if boundary is not None:
+            self.mutate(context, 'bridge', g.points, {'count': boundary[0], 'closed': boundary[1]})
+            return
+        screen = [Vector(p) for p in g.screen]
+        length = sum((b - a).length for a, b in zip(screen, screen[1:]))
+        closed = self.scene.rf_rs_closed or (
+            len(screen) > 6 and (screen[0] - screen[-1]).length < 24 * self.scale
+            and length > 120 * self.scale)
+        count = max(self.scene.rf_rs_count, 3 if closed else 2)
+        self.mutate(context, 'stroke', g.points, {'count': count, 'closed': closed}, selection=[])
+
+    def _line_anchor(self, a, b):
+        best = None
+        for k in range(33):
+            t = k / 32
+            hit = self._hit((a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t))
+            if hit is not None and (best is None or abs(t - 0.5) < best[0]):
+                best = (abs(t - 0.5), hit)
+        return None if best is None else best[1]
+
+    def commit_line(self, context, g):
+        a, b = Vector(g.screen[0]), Vector(g.screen[1])
+        if (b - a).length < 6 * self.scale:
+            raise UserError('Drag a longer line')
+        anchor = self._line_anchor(a, b)
+        if anchor is None:
+            raise UserError('The line must cross the source surface')
+        start = view3d_utils.region_2d_to_location_3d(self.region, self.rv3d, a, anchor)
+        end = view3d_utils.region_2d_to_location_3d(self.region, self.rv3d, b, anchor)
+        ray = view3d_utils.region_2d_to_vector_3d(self.region, self.rv3d, (a + b) / 2)
+        normal = (end - start).cross(ray)
+        if normal.length < 1e-12:
+            raise UserError('Drag a longer line')
+        normal.normalize()
+        plane = {'origin': list(anchor), 'normal': list(normal)}
+        cache = self.cache.ensure()
+        if self.tool == 'Contours':
+            boundary = None if g.separate else cache.selected_boundary()
+            if boundary is not None:
+                try:
+                    self.mutate(context, 'contour_bridge', [anchor], dict(plane, count=boundary[0]))
+                    return
+                except engine.EngineError as exc:
+                    if 'match' not in str(exc):
+                        raise
+                    # e.g. a closed selected loop and an open section: still add the ring.
+                    self.toast('Section does not match the selected boundary; added a separate ring')
+            self.mutate(context, 'contour', [anchor], dict(plane, count=self.scene.rf_rs_count))
+            return
+        faces = cache.faces_crossing(np.asarray(a), np.asarray(b), self.region, self.rv3d, self.bvh)
+        if not faces:
+            raise UserError('The knife line must cross visible target faces')
+        self.mutate(context, 'knife', extra=dict(plane, faces=faces))
+
+    # -------------------------------------------------------------- brushes
+    def brush_begin(self):
+        if self.target.data.shape_keys is not None:
+            raise UserError('Brushes do not support shape-key meshes')
+        cache = self.cache.ensure()
+        radius = self.scene.rf_rs_brush_radius * self.scale
+        mask = cache.selected if self.scene.rf_rs_brush_selected else None
+        self.history.begin()
+        g = SimpleNamespace(kind=self.tool.lower(), moved=False, transaction=True, last=0.0,
+                            start=self.mouse, radius=radius, mask=mask)
+        self.gesture = g
+        if g.kind == 'tweak':
+            indices, distance = cache.in_circle(self.mouse, radius, self.region, self.rv3d, self.bvh, mask)
+            g.indices = indices
+            g.weights = falloff(distance / radius)
+            g.origin = cache.world[indices].copy()
+            g.anchor = Vector(cache.world[indices[np.argmin(distance)]]) if len(indices) else None
+        else:
+            self.relax_step()
+
+    def _project(self, points):
+        result = np.empty_like(points)
+        for i, p in enumerate(points):
+            nearest = self.bvh.find_nearest(Vector(p))[0]
+            result[i] = nearest if nearest is not None else p
+        return result
+
+    def tweak_move(self):
+        g = self.gesture
+        if g.anchor is None or not len(g.indices):
+            return
+        start = view3d_utils.region_2d_to_location_3d(self.region, self.rv3d, Vector(g.start), g.anchor)
+        now = view3d_utils.region_2d_to_location_3d(self.region, self.rv3d, Vector(self.mouse), g.anchor)
+        delta = np.asarray(now - start)
+        moved = g.origin + g.weights[:, None] * delta
+        self.cache.set_world(g.indices, self._project(moved))
+        g.moved = True
+
+    def relax_step(self):
+        g = self.gesture
+        g.last = time.monotonic()
+        cache = self.cache
+        indices, distance = cache.in_circle(self.mouse, g.radius, self.region, self.rv3d, self.bvh, g.mask)
+        keep = ~cache.boundary[indices] if len(indices) else np.zeros(0, bool)
+        indices, distance = indices[keep], distance[keep]
+        if not len(indices):
+            return
+        weights = falloff(distance / g.radius) * self.scene.rf_rs_strength
+        adjacency = cache.adjacency()
+        world = cache.world
+        moved = world[indices].copy()
+        for k, i in enumerate(indices.tolist()):
+            neighbours = adjacency[i]
+            if len(neighbours):
+                moved[k] += (world[neighbours].mean(axis=0) - world[i]) * weights[k]
+        cache.set_world(indices, self._project(moved))
+        g.moved = True
+        self._redraw()
+
+    # ------------------------------------------------------------- drawing
+    def _draw_here(self):
+        return (not self.finished and bpy.context.area == self.area and
+                bpy.context.region == self.region)
+
+    def _target_batches(self, cache):
+        rv3d = self.rv3d
+        key = (cache.version, tuple(tuple(r) for r in rv3d.view_matrix), rv3d.is_perspective)
+        if key == self.batch_key:
+            return self.batches
+        self.batch_key = key
+        world = cache.world
+        inverse = rv3d.view_matrix.inverted()
+        # Nudge toward the viewer so faces lying on the source win the depth test.
+        if rv3d.is_perspective:
+            offset = (np.asarray(inverse.translation) - world) * 0.002
+        else:
+            offset = np.asarray(inverse.col[2][:3]) * rv3d.view_distance * 0.002
+        pos = (world + offset).tolist() if len(world) else []
+        batches = {}
+        if len(cache.tris):
+            batches['faces'] = gfx.tri_batch(pos, indices=cache.tris.tolist())
+        if len(cache.edges):
+            both = cache.selected[cache.edges].all(axis=1)
+            for name, mask in (('edges', ~both), ('edges_selected', both)):
+                pairs = cache.edges[mask].ravel().tolist()
+                if pairs:
+                    batches[name] = gfx.line_batch([pos[i] for i in pairs])
+        visible = ~cache.hidden
+        for name, mask in (('verts', visible & ~cache.selected), ('verts_selected', visible & cache.selected)):
+            ids = np.flatnonzero(mask).tolist()
+            if ids:
+                batches[name] = gfx.point_batch([pos[i] for i in ids])
+        self.batches = batches
+        return batches
+
+    def draw_3d(self):
+        if not self._draw_here() or self.render_failed:
+            return
+        try:
+            cache = self.cache.ensure()
+            px = bpy.context.preferences.system.pixel_size
+            batches = self._target_batches(cache)
+            gpu.state.blend_set('ALPHA')
+            gpu.state.depth_mask_set(False)
+            # X-ray ghost first: flat faces cut through curved sources, so parts
+            # of the retopology sit just under the surface. Keep them readable.
+            gpu.state.depth_test_set('NONE')
+            self._draw_target(batches, px, ghost=True)
+            gpu.state.depth_test_set('LESS_EQUAL')
+            self._draw_target(batches, px, ghost=False)
+            gpu.state.depth_test_set('NONE')
+            self._draw_previews(cache, px)
+        except Exception as exc:
+            # Never break Blender's draw loop; fall back to Blender's display.
+            self.render_failed = True
+            try:
+                self.target.hide_set(False)
+                self.target.show_in_front = True
+            except Exception:
+                pass
+            self.toast(f'Overlay renderer unavailable ({exc}); using Blender display', 'error')
+        finally:
+            gpu.state.depth_test_set('NONE')
+            gpu.state.depth_mask_set(True)
+            gpu.state.blend_set('NONE')
+            gpu.state.point_size_set(1.0)
+
+    @staticmethod
+    def _draw_target(batches, px, ghost):
+        def tone(name, factor=0.3):
+            r, g, b, a = COLORS[name]
+            return (r, g, b, a * factor) if ghost else (r, g, b, a)
+        if 'faces' in batches:
+            gfx.draw_tris(batches['faces'], tone('face', 0.35))
+        if 'edges' in batches:
+            gfx.draw_lines(batches['edges'], tone('edge'), 1.5 * px)
+        if 'edges_selected' in batches:
+            gfx.draw_lines(batches['edges_selected'], tone('selected'), 2.5 * px)
+        if 'verts' in batches:
+            gfx.draw_points(batches['verts'], tone('vertex'), 6 * px)
+        if 'verts_selected' in batches:
+            gfx.draw_points(batches['verts_selected'], tone('selected'), 8 * px)
+
+    def _draw_previews(self, cache, px):
+        hover = self.hover
+        world = cache.world
+        if self.tool == 'PolyPen' and hover is not None and self.gesture is None:
+            point = tuple(hover['point'])
+            order = cache.order
+            if len(order) <= 2:
+                lines = []
+                for i in order:
+                    lines += [tuple(world[i]), point]
+                if lines:
+                    gfx.lines(lines, COLORS['preview'], 2 * px)
+            if hover['kind'] == 'edge':
+                a, b = cache.edges[hover['edge']].tolist()
+                gfx.lines([tuple(world[a]), tuple(world[b])], COLORS['hover'], 3 * px)
+            gfx.points([point], COLORS['hover'] if hover['kind'] == 'vertex' else COLORS['preview'],
+                       (11 if hover['kind'] == 'vertex' else 8) * px)
+        elif self.tool == 'Select' and hover is not None:
+            if hover['kind'] == 'vertex':
+                gfx.points([tuple(world[hover['vertex']])], COLORS['hover'], 10 * px)
+            else:
+                a, b = cache.edges[hover['edge']].tolist()
+                gfx.lines([tuple(world[a]), tuple(world[b])], COLORS['hover'], 3 * px)
+        elif self.tool == 'Loops' and hover is not None:
+            a, b = cache.edges[hover['edge']].tolist()
+            gfx.lines([tuple(world[a]), tuple(world[b])], COLORS['hover'], 3 * px)
+            segments = [tuple(p) for pair in hover['ring'] for p in pair]
+            gfx.lines(segments, COLORS['preview'], 2.5 * px)
+        if self.corners:
+            corners = [tuple(p) for p in self.corners]
+            tail = [tuple(hover['point'])] if hover is not None and hover.get('point') is not None else []
+            path = corners + tail
+            if len(corners) == 3 and tail:
+                path = path + corners[:1]
+            gfx.lines(path, COLORS['preview'], 2 * px, strip=True)
+            gfx.points(corners, COLORS['preview'], 9 * px)
+        elif self.tool in ('Patches', 'Strokes', 'PolyStrips') and hover is not None and self.gesture is None:
+            gfx.points([tuple(hover['point'])], COLORS['preview_soft'], 8 * px)
+
+    def draw_2d(self):
+        if not self._draw_here():
+            return
+        try:
+            gpu.state.blend_set('ALPHA')
+            s = self.scale
+            g = self.gesture
+            if g is not None and g.kind == 'stroke':
+                gfx.lines(g.screen, COLORS['preview'], 2.5 * s, strip=True)
+            elif g is not None and g.kind == 'line':
+                gfx.lines(g.screen, COLORS['preview'], 2 * s)
+                gfx.points(g.screen, COLORS['preview'], 7 * s)
+            elif g is not None and g.kind == 'select':
+                (x0, y0), (x1, y1) = g.start, self.mouse
+                gfx.tris([(x0, y0), (x1, y0), (x1, y1), (x0, y0), (x1, y1), (x0, y1)], (1, 1, 1, 0.06))
+                gfx.lines([(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)], COLORS['box'], 1.0, strip=True)
+            if self.tool in ('Tweak', 'Relax') and (self.hover_widget is None or g is not None):
+                radius = self.scene.rf_rs_brush_radius * s
+                x, y = self.mouse
+                active = g is not None
+                gfx.circle(x, y, radius, (1, 1, 1, 0.9 if active else 0.6), 1.5 * s,
+                           fill=(0.3, 0.68, 1.0, 0.10 if active else 0.04))
+            hud.draw(self.frame(), self.hover_widget)
+        except Exception:
+            pass   # the HUD must never break Blender's drawing
+        finally:
+            gpu.state.blend_set('NONE')
 
 
 class RF_RS_OT_session(bpy.types.Operator):
+    """Retopologize the active (or a new) mesh on top of the source in this viewport"""
     bl_idname = 'mesh.rf_rs_session'
     bl_label = 'Retopo RS Session'
     bl_options = {'UNDO', 'BLOCKING'}
@@ -159,570 +1319,26 @@ class RF_RS_OT_session(bpy.types.Operator):
     tool: EnumProperty(name='Tool', items=[(t, t, '') for t in TOOLS], default='Select')
     new_target: BoolProperty(name='Create New Target', default=False)
 
-    def _snapshot(self, owner, name, value):
-        if hasattr(owner, name):
-            previous = getattr(owner, name)
-            self._settings.append((owner, name, previous))
-            # Region visibility setters can toggle even when assigned their
-            # current value; avoid redundant writes on entry and restoration.
-            if previous != value:
-                setattr(owner, name, value)
-
-    def _restore_settings(self):
-        for owner, name, value in reversed(self._settings):
-            try:
-                if getattr(owner, name) != value:
-                    setattr(owner, name, value)
-            except (ReferenceError, RuntimeError, AttributeError):
-                pass
-        self._settings.clear()
+    @classmethod
+    def poll(cls, context):
+        return context.area is not None and context.area.type == 'VIEW_3D'
 
     def invoke(self, context, event):
-        global _SESSION
-        if active_session() is not None:
-            self.report({'WARNING'}, 'A Retopo RS session is already active')
-            return {'CANCELLED'}
-        if context.area is None or context.area.type != 'VIEW_3D':
-            self.report({'ERROR'}, 'Start in a 3D viewport')
-            return {'CANCELLED'}
-        obj = context.active_object
-        if obj is None or obj.type != 'MESH' or context.mode not in {'OBJECT', 'EDIT_MESH'}:
-            self.report({'ERROR'}, 'Start with an active mesh in Object or Edit Mode')
-            return {'CANCELLED'}
-        self._settings = []
-        self._handles = []
-        self._source_handle = None
-        self._history = None
-        self._finished = False
-        self._created = None
-        self._target = None
-        self._area = context.area
-        self._space = context.space_data
-        self._workspace = context.workspace
-        self._window = context.window
-        self._scene = context.scene
-        self._view_layer = context.view_layer
-        self._original_active = obj
-        self._original_selected = list(context.selected_objects)
-        self._original_mode = context.mode
-        self._original_source = context.scene.rf_rs_source
-        self._points, self._screen = [], []
-        self._hover = (0, 0)
-        self._drawing = False
-        self._region = next((r for r in self._area.regions if r.type == 'WINDOW'), None)
-        self._rv3d = self._space.region_3d
-        self._message = ''
-        _SESSION = self
+        tool = self.tool if self.properties.is_property_set('tool') else context.scene.rf_rs_tool
         try:
-            if obj.library or obj.data.library:
-                raise RuntimeError('Target must be editable')
-            if self._region is None:
-                raise RuntimeError('Viewport has no window region')
-            if context.mode == 'EDIT_MESH':
-                bpy.ops.object.mode_set(mode='OBJECT')
-            visible_sources = [o for o in context.visible_objects
-                               if o != obj and o.type == 'MESH' and (len(o.data.polygons) or o.modifiers)]
-            explicit_source = self._original_source
-            # The Source picker defines a source, never the target. A lone
-            # polygon mesh launched in Object Mode is also a new-target entry.
-            create_target = (self.new_target or obj == explicit_source or
-                             (self._original_mode == 'OBJECT' and len(obj.data.polygons)
-                              and not visible_sources and explicit_source is None))
-            if create_target:
-                mesh = bpy.data.meshes.new('Retopo Target')
-                self._created = bpy.data.objects.new('Retopo Target', mesh)
-                context.collection.objects.link(self._created)
-                self._target = self._created
-            else:
-                self._target = obj
-            sources = [o for o in context.visible_objects
-                       if o != self._target and o.type == 'MESH' and (len(o.data.polygons) or o.modifiers)]
-            pointer = self._original_source
-            if pointer is not None and pointer != self._target and pointer.type == 'MESH' and pointer not in sources:
-                sources.append(pointer)  # An explicitly chosen source may be hidden.
-            if not sources:
-                raise RuntimeError('No source mesh for the active target. Select the high-poly object '
-                                   'in the Source picker, or select it in Object Mode and use + to create a target.')
-            vertices, triangles, usable, warnings = [], [], [], []
-            skipped = 0
-            for source in sources:
-                try:
-                    data = adapter()._source_geometry(context, source)
-                except RuntimeError as exc:
-                    if source == pointer:
-                        raise
-                    warnings.append(str(exc))
-                    continue
-                usable.append(source)
-                skipped += data.get('skipped_triangles', 0)
-                offset = len(vertices)
-                vertices.extend(data['vertices'])
-                triangles.extend([[i + offset for i in tri] for tri in data['triangles']])
-            if not triangles:
-                raise RuntimeError('No usable source surfaces. ' + '; '.join(warnings))
-            self._sources = tuple(usable)
-            if skipped or warnings:
-                self._message = f'Source cleanup: skipped {skipped} zero-area triangles; excluded {len(warnings)} unusable meshes'
-                self.report({'WARNING'}, self._message)
-            sources = usable
-            self._source = {'vertices': vertices, 'triangles': triangles}
-            self._bvh = BVHTree.FromPolygons(vertices, triangles, all_triangles=True)
-            self._source_handle = adapter()._cache_source(self._source)
-            self._history = SessionHistory(self._target)
-            # Only alter viewport state once all sources and the native cache exist.
-            self._scene.rf_rs_source = pointer if pointer in sources else sources[0]
-            for selected in context.selected_objects:
-                selected.select_set(False)
-            self._target.select_set(True)
-            context.view_layer.objects.active = self._target
-            self._snapshot(self._target, 'display_type', 'WIRE')
-            self._snapshot(self._target, 'show_in_front', True)
-            self._snapshot(self._space.overlay, 'show_overlays', True)
-            self._snapshot(self._space, 'show_gizmo', False)
-            for name in ('show_region_ui', 'show_region_toolbar', 'show_region_tool_header'):
-                self._snapshot(self._space, name, False)
-            self._handles.append(bpy.types.SpaceView3D.draw_handler_add(
-                self._draw, (), 'WINDOW', 'POST_PIXEL'))
-            self._handles.append(bpy.types.SpaceView3D.draw_handler_add(
-                self._draw_vertices, (), 'WINDOW', 'POST_VIEW'))
-            self._workspace.status_text_set(
-                'Retopo RS | 1–0 tools | Esc finish | Shift Esc discard session | exit before saving')
-            context.window_manager.modal_handler_add(self)
-            self._area.tag_redraw()
-            return {'RUNNING_MODAL'}
-        except Exception as exc:
+            self._session = Session(context, tool, self.new_target, self.report)
+        except (RuntimeError, ValueError) as exc:
             self.report({'ERROR'}, str(exc))
-            self._finish(context, True)
             return {'CANCELLED'}
-
-    def _finish(self, context, cancel=False):
-        global _SESSION
-        if getattr(self, '_finished', True):
-            return
-        self._finished = True
-        try:
-            if self._history is not None:
-                try:
-                    self._history.close(cancel)
-                except (ReferenceError, RuntimeError):
-                    pass
-            if cancel and self._created is not None:
-                try:
-                    mesh = self._created.data
-                    bpy.data.objects.remove(self._created, do_unlink=True)
-                    _discard(mesh)
-                except ReferenceError:
-                    pass
-        finally:
-            for handle in self._handles:
-                try:
-                    bpy.types.SpaceView3D.draw_handler_remove(handle, 'WINDOW')
-                except (ValueError, ReferenceError):
-                    pass
-            self._handles.clear()
-            if self._source_handle:
-                try:
-                    adapter()._load_library().rf_source_free(self._source_handle)
-                except Exception:
-                    pass
-                finally:
-                    self._source_handle = None
-            self._restore_settings()
-            try:
-                self._scene.rf_rs_source = self._original_source
-            except (ReferenceError, RuntimeError):
-                pass
-            try:
-                for obj in self._view_layer.objects:
-                    obj.select_set(False)
-                if not cancel and self._created is not None:
-                    # New-target sessions finish on the retopology, not the source.
-                    self._target.select_set(True)
-                    self._view_layer.objects.active = self._target
-                    return_to_edit = True
-                else:
-                    for obj in self._original_selected:
-                        try:
-                            obj.select_set(True)
-                        except (ReferenceError, RuntimeError):
-                            pass
-                    self._view_layer.objects.active = self._original_active
-                    return_to_edit = self._original_mode == 'EDIT_MESH' and self._original_active is not None
-                if return_to_edit:
-                    with context.temp_override(window=self._window, area=self._area):
-                        if context.mode == 'OBJECT':
-                            bpy.ops.object.mode_set(mode='EDIT')
-            except (ReferenceError, RuntimeError, TypeError):
-                pass
-            try:
-                self._workspace.status_text_set(None)
-                self._area.tag_redraw()
-            except ReferenceError:
-                pass
-            if _SESSION is self:
-                _SESSION = None
-
-    def cancel(self, context):
-        self._finish(context, True)
-
-    def _inside(self, event):
-        return (self._region.x <= event.mouse_x < self._region.x + self._region.width and
-                self._region.y <= event.mouse_y < self._region.y + self._region.height)
-
-    def _coordinate(self, event):
-        return event.mouse_x - self._region.x, event.mouse_y - self._region.y
-
-    def _hit(self, context, event):
-        return adapter().RF_RS_OT_draw._hit(self, context, event)
-
-    def _view_point(self, coordinate):
-        return adapter().RF_RS_OT_draw._view_point(self, coordinate)
-
-    def _edge(self, event):
-        return adapter().RF_RS_OT_draw._edge(self, event)
-
-    def _reset_gesture(self):
-        self._drawing = False
-        self._points.clear()
-        self._screen.clear()
-
-    def _abort_gesture(self):
-        self._history.rollback()
-        self._reset_gesture()
-
-    def _mutate(self, context, operation, points=(), extra=None):
-        self._history.begin()
-        try:
-            adapter()._execute(context, operation, points, self._target,
-                               self._source, extra, self._source_handle)
-        except Exception:
-            self._history.rollback()
-            raise
-        else:
-            self._history.commit()
-        finally:
-            self._reset_gesture()
-
-    def _select(self, context, event):
-        cursor = Vector(self._coordinate(event))
-        best = None
-        for vertex in self._target.data.vertices:
-            if vertex.hide:
-                continue
-            screen = view3d_utils.location_3d_to_region_2d(
-                self._region, self._rv3d, self._target.matrix_world @ vertex.co)
-            if screen is not None:
-                candidate = ((screen-cursor).length, vertex.index)
-                if candidate[0] <= 16 and (best is None or candidate < best):
-                    best = candidate
-        selected = adapter()._selected(self._target) if event.shift else []
-        if best:
-            if best[1] in selected:
-                selected.remove(best[1])
-            else:
-                selected.append(best[1])
-        self._history.begin()
-        try:
-            if self._target.data.users > 1:
-                self._target.data = self._target.data.copy()
-            adapter()._set_selection(self._target.data, selected)
-            adapter()._remember_selection(self._target, selected)
-            self._history.commit()
-        except Exception:
-            self._history.rollback()
-            raise
-        context.view_layer.update()
-
-    def _boundary(self, closed):
-        selected = set(adapter()._selected(self._target))
-        if not selected:
-            return False
-        uses = {}
-        for face in self._target.data.polygons:
-            indices = list(face.vertices)
-            for a, b in zip(indices, indices[1:] + indices[:1]):
-                key = tuple(sorted((a, b)))
-                uses[key] = uses.get(key, 0) + 1
-        edges = [tuple(e.vertices) for e in self._target.data.edges
-                 if all(i in selected for i in e.vertices) and
-                 uses.get(tuple(sorted(e.vertices)), 0) <= 1]
-        degrees = {i: [] for i in selected}
-        for a, b in edges:
-            degrees[a].append(b)
-            degrees[b].append(a)
-        # Native count is vertices/samples for both open chains and loops.
-        expected = self._scene.rf_rs_count
-        if len(selected) != expected or not edges:
-            return False
-        if closed:
-            valid = all(len(n) == 2 for n in degrees.values())
-        else:
-            valid = (sum(len(n) == 1 for n in degrees.values()) == 2 and
-                     all(len(n) in (1, 2) for n in degrees.values()))
-        seen, todo = set(), [next(iter(selected))]
-        while todo:
-            i = todo.pop()
-            if i not in seen:
-                seen.add(i)
-                todo.extend(degrees[i])
-        return valid and seen == selected
-
-    def _option_rows(self):
-        return [(name, self._region.width - 250, self._region.height - 65 - i*27)
-                for i, name in enumerate(OPTIONS[self.tool])]
-
-    def _ui(self, event):
-        x, y = self._coordinate(event)
-        press = event.type == 'LEFTMOUSE' and event.value == 'PRESS'
-        wheel = event.type in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE'}
-        if self._points or self._drawing:
-            return False
-        if 12 <= x <= 180 and self._region.height-52-10*28 <= y <= self._region.height-48:
-            if press:
-                index = int((self._region.height-48-y)//28)
-                if 0 <= index < len(TOOLS):
-                    self.tool = TOOLS[index]
-            return True
-        for name, left, baseline in self._option_rows():
-            if left <= x <= self._region.width-12 and baseline-6 <= y <= baseline+20:
-                if press or wheel:
-                    prop = 'rf_rs_' + name
-                    value = getattr(self._scene, prop)
-                    direction = (1 if event.type == 'WHEELUPMOUSE' else -1) if wheel else (
-                        1 if x > self._region.width-45 else -1)
-                    step = .05 if name in {'strength', 'factor'} else (.01 if name == 'width' else 1)
-                    setattr(self._scene, prop, not value if name == 'closed' else value + direction*step)
-                return True
-        return False
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
 
     def modal(self, context, event):
-        if self._finished:
-            return {'FINISHED'}
-        try:
-            if (context.area != self._area or self._area.type != 'VIEW_3D' or
-                    context.active_object != self._target or context.mode != 'OBJECT'):
-                raise RuntimeError('Session context changed; ending session')
-            # Block global saves and Blender undo even when the pointer is outside.
-            if event.ctrl and event.type == 'S':
-                self._message = 'Exit the session before saving (temporary viewport state).'
-                self._area.tag_redraw()
-                return {'RUNNING_MODAL'}
-            press = event.value == 'PRESS'
-            if press and event.type == 'ESC' and event.shift:
-                self._finish(context, True)
-                return {'CANCELLED'}
-            if press and event.type in {'ESC', 'RIGHTMOUSE'}:
-                if self._points or self._drawing:
-                    self._abort_gesture()
-                else:
-                    self._finish(context)
-                    return {'FINISHED'}
-                return {'RUNNING_MODAL'}
-            if event.ctrl and event.type in {'Z', 'Y'}:
-                if press:
-                    self._abort_gesture()
-                    self._history.step(event.type == 'Y' or event.shift)
-                    context.view_layer.update()
-                    self._area.tag_redraw()
-                return {'RUNNING_MODAL'}
-            if not self._inside(event):
-                if self._drawing and event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
-                    self._abort_gesture()
-                return {'PASS_THROUGH'}
-            self._hover = self._coordinate(event)
-            self._area.tag_redraw()
-            if self._ui(event):
-                return {'RUNNING_MODAL'}
-            idle = not self._points and not self._drawing
-            if idle and press:
-                if event.type in KEYS:
-                    self.tool = KEYS[event.type]
-                    return {'RUNNING_MODAL'}
-                if event.type == 'W':
-                    self.tool = 'Select'
-                    return {'RUNNING_MODAL'}
-                if event.type == 'Q':
-                    self.tool = TOOLS[(TOOLS.index(self.tool)+1) % len(TOOLS)]
-                    return {'RUNNING_MODAL'}
-                if event.type in {'RET', 'NUMPAD_ENTER', 'TAB'}:
-                    self._finish(context)
-                    return {'FINISHED'}
-                if event.type == 'A':
-                    self._mutate(context, 'select_none' if event.alt else 'select_all')
-                    return {'RUNNING_MODAL'}
-                shortcuts = {'I': 'select_invert', 'L': 'select_connected'}
-                operation = shortcuts.get(event.type) if event.ctrl else {
-                    'M': 'merge', 'F': 'fill_patch'}.get(event.type)
-                if operation:
-                    self._mutate(context, operation)
-                    return {'RUNNING_MODAL'}
-                if event.type in {'X', 'DEL'}:
-                    self._mutate(context, 'delete')
-                    return {'RUNNING_MODAL'}
-            if (event.type in {'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE',
-                               'TRACKPADPAN', 'TRACKPADZOOM', 'NDOF_MOTION'} or event.alt):
-                return {'PASS_THROUGH'} if idle else {'RUNNING_MODAL'}
-            left_press = event.type == 'LEFTMOUSE' and press
-            release = event.type == 'LEFTMOUSE' and event.value == 'RELEASE'
-            if self.tool == 'Select' or (idle and left_press and event.shift):
-                if left_press:
-                    self._select(context, event)
-                return {'RUNNING_MODAL'}
-            operation = OPERATIONS[self.tool]
-            if left_press:
-                if operation == 'loops':
-                    self._mutate(context, operation, extra={'edge': self._edge(event)})
-                    return {'RUNNING_MODAL'}
-                if operation == 'relax':
-                    if not adapter()._selected(self._target):
-                        raise ValueError('Select vertices before relaxing')
-                    self._mutate(context, operation)
-                    return {'RUNNING_MODAL'}
-                hit = self._hit(context, event)
-                if hit is None:
-                    raise ValueError('Start on the source surface')
-                self._anchor = hit.copy()
-                self._points.append(hit.copy())
-                self._screen.append(self._coordinate(event))
-                if operation == 'polypen':
-                    extra = {}
-                    try:
-                        extra['edge'] = self._edge(event)
-                    except RuntimeError:
-                        pass
-                    self._mutate(context, operation, list(self._points), extra)
-                elif operation == 'patch':
-                    if len(self._points) == 4:
-                        self._mutate(context, operation, list(self._points))
-                else:
-                    self._drawing = True
-            elif self._drawing and event.type in {'MOUSEMOVE', 'LEFTMOUSE'}:
-                extra = {}
-                if operation in {'stroke', 'polystrip'}:
-                    hit = self._hit(context, event)
-                    if hit is not None and (hit-self._points[-1]).length > 1e-6:
-                        self._points.append(hit.copy())
-                        self._screen.append(self._coordinate(event))
-                else:
-                    self._screen = [self._screen[0], self._coordinate(event)]
-                if release:
-                    points = list(self._points)
-                    if operation in {'knife', 'contour', 'tweak'}:
-                        start, end = (self._view_point(p) for p in (self._screen[0], self._screen[-1]))
-                        delta = end-start
-                        if delta.length < 1e-6:
-                            raise ValueError('Draw a nonzero segment')
-                        if operation == 'tweak':
-                            if not adapter()._selected(self._target):
-                                raise ValueError('Select vertices before tweaking')
-                            points = [delta]
-                        else:
-                            view = view3d_utils.region_2d_to_vector_3d(
-                                self._region, self._rv3d, self._screen[0])
-                            extra = {'origin': list(start), 'normal': list(delta.cross(view).normalized())}
-                    elif len(points) < 2:
-                        raise ValueError('Draw at least two surface points')
-                    closed = self._scene.rf_rs_closed
-                    if operation == 'stroke' and self._boundary(closed):
-                        operation = 'bridge'
-                    elif operation == 'contour' and (self._boundary(True) or self._boundary(False)):
-                        operation = 'contour_bridge'
-                    self._mutate(context, operation, points, extra)
-            return {'RUNNING_MODAL'}
-        except (ValueError, RuntimeError) as exc:
-            self._message = str(exc)
-            self.report({'WARNING'}, str(exc))
-            try:
-                self._abort_gesture()
-                if (context.active_object == self._target and context.area == self._area
-                        and self._area.type == 'VIEW_3D' and context.mode == 'OBJECT'):
-                    return {'RUNNING_MODAL'}
-            except (ReferenceError, RuntimeError):
-                pass
-            self._finish(context)
-            return {'FINISHED'}
-        except Exception as exc:
-            self.report({'ERROR'}, str(exc))
-            self._finish(context)
-            return {'FINISHED'}
+        return self._session.modal(context, event)
 
-    def _draw_here(self):
-        return (not self._finished and bpy.context.area == self._area and
-                bpy.context.region == self._region)
-
-    @staticmethod
-    def _text(x, y, text, color=(.9, .93, .96, 1), size=14):
-        try:
-            blf.size(0, size)
-        except TypeError:
-            blf.size(0, size, 72)
-        blf.position(0, x, y, 0)
-        blf.color(0, *color)
-        blf.draw(0, text)
-
-    @staticmethod
-    def _batch(kind, points, color):
-        try:
-            shader = gpu.shader.from_builtin('UNIFORM_COLOR')
-        except ValueError:
-            shader = gpu.shader.from_builtin(
-                '2D_UNIFORM_COLOR' if len(points[0]) == 2 else '3D_UNIFORM_COLOR')
-        batch = batch_for_shader(shader, kind, {'pos': points})
-        shader.bind()
-        shader.uniform_float('color', color)
-        batch.draw(shader)
-
-    def _draw(self):
-        if not self._draw_here():
-            return
-        try:
-            h, w = self._region.height, self._region.width
-            gpu.state.blend_set('ALPHA')
-            self._batch('TRIS', [(8, h-340), (184, h-340), (184, h-16),
-                                  (8, h-340), (184, h-16), (8, h-16)], (.025, .035, .045, .88))
-            self._text(18, h-35, 'RETOPO RS', size=16)
-            for i, tool in enumerate(TOOLS):
-                y = h-68-i*28
-                self._text(20, y, f'{(i+1)%10}  {tool}',
-                           (.2, .85, 1, 1) if tool == self.tool else (.8, .82, .85, 1))
-            self._text(w-250, h-35, self.tool + ' options')
-            for name, x, y in self._option_rows():
-                value = getattr(self._scene, 'rf_rs_' + name)
-                formatted = f'{value:.3g}' if isinstance(value, float) else str(value)
-                self._text(x, y, f'{name.title()}: {formatted}   − / +')
-            mesh = self._target.data
-            self._text(18, 65, f'Verts {len(mesh.vertices)}   Edges {len(mesh.edges)}   Faces {len(mesh.polygons)}'
-                       f'   Selected {len(adapter()._selected(self._target))}')
-            self._text(18, 87, HELP[self.tool], size=12)
-            self._text(18, 44, 'Q cycles (no pie) | Ctrl-Z / Shift-Ctrl-Z undo/redo | M merge | X delete', size=12)
-            self._text(18, 26, 'Esc: cancel gesture / finish idle | Shift-Esc: discard session | Tab/Enter idle: finish | exit before save', size=12)
-            self._text(195, h-24, self._message or f'Target: {self._target.name} | Sources: {len(self._sources)} | input-stroke preview', size=12)
-            points = list(self._screen)
-            if self.tool == 'Patches' and points:
-                points += [self._hover, points[0]]
-            if len(points) > 1:
-                self._batch('LINE_STRIP', points, (.2, .85, 1, 1))
-        except Exception:
-            # Draw callbacks must not break Blender's drawing loop.
-            self._message = 'Overlay unavailable; Esc exits safely'
-        finally:
-            gpu.state.blend_set('NONE')
-
-    def _draw_vertices(self):
-        if not self._draw_here():
-            return
-        try:
-            selected = adapter()._selected(self._target)
-            points = [self._target.matrix_world @ self._target.data.vertices[i].co for i in selected]
-            if points:
-                gpu.state.blend_set('ALPHA')
-                gpu.state.point_size_set(6)
-                self._batch('POINTS', points, (1, .55, .12, 1))
-        except Exception:
-            pass
-        finally:
-            gpu.state.point_size_set(1)
-            gpu.state.blend_set('NONE')
+    def cancel(self, context):
+        # Blender-initiated cancellation (file load, window closed): keep work.
+        self._session.finish(context, cancel=False)
 
 
 CLASSES = (RF_RS_OT_session,)

@@ -1,6 +1,6 @@
 """After building: blender --background --factory-startup --python-exit-code 1 --python tests/blender_smoke.py"""
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import bpy
 from mathutils import Vector

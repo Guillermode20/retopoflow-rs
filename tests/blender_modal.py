@@ -1,9 +1,11 @@
 """Exercise modal state transitions with deterministic hits; no GPU/mouse claims."""
+import sys
 from pathlib import Path
 from types import SimpleNamespace
-import sys
+
 import bpy
 from mathutils import Vector
+
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'blender'))
 import retopoflow_rs as addon
 
@@ -28,15 +30,15 @@ def main():
                 self.operation=operation; self.persistent=persistent
                 self._area=area; self._target=target; self._points=[]; self._screen=[]
                 self._drawing=False; self._commits=0; self.finished=False
-                self._source=addon._source_geometry(bpy.context,source)
-                self._source_handle=addon._cache_source(self._source)
+                self._source=addon.engine.source_geometry(bpy.context,source)
+                self._source_handle=addon.engine.cache_source(self._source)
                 self.hit=Vector((0,0,0))
             def _inside(self,event): return True
             def _coordinate(self,event): return (10,10)
             def _hit(self,context,event): return self.hit.copy()
             def _edge(self,event): raise RuntimeError('No edge under deterministic hit')
             def _finish(self,context):
-                if self._source_handle: addon._load_library().rf_source_free(self._source_handle)
+                if self._source_handle: addon.engine.free_source(self._source_handle)
                 self._source_handle=None; self.finished=True
             def report(self,kind,message): self.last_error=message
         def event(kind,value='PRESS'):
@@ -44,12 +46,12 @@ def main():
         with bpy.context.temp_override(area=area,region=region):
             session=Session('polypen',True)
             try:
-                assert addon.RF_RS_OT_draw.modal(session,bpy.context,event('LEFTMOUSE'))=={'RUNNING_MODAL'}
+                assert addon.legacy.RF_RS_OT_draw.modal(session,bpy.context,event('LEFTMOUSE'))=={'RUNNING_MODAL'}
                 session.hit=Vector((1,0,0))
-                assert addon.RF_RS_OT_draw.modal(session,bpy.context,event('LEFTMOUSE'))=={'RUNNING_MODAL'}
+                assert addon.legacy.RF_RS_OT_draw.modal(session,bpy.context,event('LEFTMOUSE'))=={'RUNNING_MODAL'}
                 assert len(target.data.vertices)==2 and len(target.data.edges)==1
-                assert addon._selected(target)==[1]
-                assert addon.RF_RS_OT_draw.modal(session,bpy.context,event('ESC'))=={'FINISHED'}
+                assert addon.engine.selected(target)==[1]
+                assert addon.legacy.RF_RS_OT_draw.modal(session,bpy.context,event('ESC'))=={'FINISHED'}
                 assert session.finished and session._source_handle is None
             finally: session._finish(bpy.context)
             before=target.data
@@ -57,8 +59,8 @@ def main():
             try:
                 for point in [(0,0,0),(1,0,0),(1,1,0)]:
                     session.hit=Vector(point)
-                    assert addon.RF_RS_OT_draw.modal(session,bpy.context,event('LEFTMOUSE'))=={'RUNNING_MODAL'}
-                assert addon.RF_RS_OT_draw.modal(session,bpy.context,event('RIGHTMOUSE'))=={'CANCELLED'}
+                    assert addon.legacy.RF_RS_OT_draw.modal(session,bpy.context,event('LEFTMOUSE'))=={'RUNNING_MODAL'}
+                assert addon.legacy.RF_RS_OT_draw.modal(session,bpy.context,event('RIGHTMOUSE'))=={'CANCELLED'}
                 assert target.data==before and len(target.data.vertices)==2
             finally: session._finish(bpy.context)
         print('Rust Blender deterministic modal tests passed')

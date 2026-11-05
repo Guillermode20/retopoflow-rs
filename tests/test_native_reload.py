@@ -1,11 +1,11 @@
 """Native reinstall regression; runs without Blender. Build native lib first."""
 import ctypes
 import importlib.util
-from pathlib import Path
 import shutil
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 LOADER = ROOT / 'blender' / 'retopoflow_rs' / 'native_loader.py'
